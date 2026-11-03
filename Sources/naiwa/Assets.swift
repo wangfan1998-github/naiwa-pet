@@ -2,18 +2,19 @@ import AppKit
 import AVFoundation
 
 /// 素材目录（scripts/make_assets.py 生成）：
-///   assets.json  {"fps": 30, "clips": {"laugh": {"video": "laugh.mov", "sound": "laugh.m4a", "frames": 122}, …}}
-///   *.mov        带透明通道的 HEVC：focus 专注 / glance 惊鸿一瞥 / laugh 捧腹大笑 / roll 笑到打滚
-///   *.m4a        对应的原声
+///   assets.json  {"fps": 30, "clips": {"laugh": {"video": "laugh.mov", "frames": 122}, …},
+///                 "closeup": {"focus": {"x":…, "y":…, "w":…, "h":…}, "glance": …}}
+///   *.mov        带透明通道的 HEVC：focus 站姿和眨眼 / glance 转头看你 / laugh 捧腹大笑 / roll 笑到打滚
+///   closeup      侧脸特写、转头特写的取景框（0–1 的比例，原点在左上）
 struct Assets {
     struct Clip {
         let video: URL
-        let sound: URL?
         let frames: Int
     }
 
     let fps: Double
     let clips: [String: Clip]
+    let closeups: [String: CGRect]
 
     static func load() -> Assets? {
         for dir in candidates() {
@@ -23,11 +24,13 @@ struct Assets {
             var clips: [String: Clip] = [:]
             for (name, c) in list {
                 guard let video = c["video"] as? String else { continue }
-                clips[name] = Clip(video: dir.appendingPathComponent(video),
-                                   sound: (c["sound"] as? String).map { dir.appendingPathComponent($0) },
-                                   frames: c["frames"] as? Int ?? 0)
+                clips[name] = Clip(video: dir.appendingPathComponent(video), frames: c["frames"] as? Int ?? 0)
             }
-            if clips["laugh"] != nil { return Assets(fps: j["fps"] as? Double ?? 30, clips: clips) }
+            var closeups: [String: CGRect] = [:]
+            for (name, r) in j["closeup"] as? [String: [String: Double]] ?? [:] {
+                closeups[name] = CGRect(x: r["x"] ?? 0, y: r["y"] ?? 0, width: r["w"] ?? 1, height: r["h"] ?? 1)
+            }
+            if clips["laugh"] != nil { return Assets(fps: j["fps"] as? Double ?? 30, clips: clips, closeups: closeups) }
         }
         return nil
     }
@@ -50,16 +53,15 @@ struct Assets {
     }
 }
 
-/// 一段片段的播放器：系统硬件解码视频，播放时按帧取出 CGImage 交给图层；可以带一段原声。
+/// 一段片段的播放器：系统硬件解码视频，播放时按帧取出 CGImage 交给图层。
 final class ClipPlayer {
     let duration: Double
     private let url: URL
     private let item: AVPlayerItem
     private let player: AVPlayer
     private let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-    private var sound: AVAudioPlayer?
     private var onEnd: (() -> Void)?
-    /// 第一帧和最后一帧（站姿、惊鸿一瞥停住的那一眼），和播放走同一条解码路径，切过去颜色不会跳
+    /// 第一帧和最后一帧（站姿、转头看你那一眼），和播放走同一条解码路径，切过去颜色不会跳
     private(set) var first: CGImage?
     private(set) var last: CGImage?
 
@@ -72,11 +74,6 @@ final class ClipPlayer {
         player.actionAtItemEnd = .pause
         player.isMuted = true
         player.preventsDisplaySleepDuringVideoPlayback = false
-        if let s = clip.sound {
-            sound = try? AVAudioPlayer(contentsOf: s)
-            sound?.volume = 0.8
-            sound?.prepareToPlay()
-        }
         NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             let done = self?.onEnd
             self?.onEnd = nil
@@ -84,20 +81,14 @@ final class ClipPlayer {
         }
     }
 
-    func play(withSound: Bool, onEnd: @escaping () -> Void) {
+    func play(onEnd: @escaping () -> Void) {
         self.onEnd = onEnd
         player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in self?.player.play() }
-        if withSound, let s = sound {
-            s.stop()
-            s.currentTime = 0
-            s.play()
-        }
     }
 
     func stop() {
         onEnd = nil
         player.pause()
-        sound?.stop()
     }
 
     /// 当前该显示的新帧；没有新帧返回 nil

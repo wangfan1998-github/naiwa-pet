@@ -11,13 +11,25 @@
   },
   "laugh": {
    "video": "laugh.mov",
-   "frames": 122,
-   "sound": "laugh.m4a"
+   "frames": 122
   },
   "roll": {
    "video": "roll.mov",
-   "frames": 221,
-   "sound": "roll.m4a"
+   "frames": 221
+  }
+ },
+ "closeup": {
+  "focus": {
+   "x": 0.3542,
+   "y": 0.0273,
+   "w": 0.3802,
+   "h": 0.3802
+  },
+  "glance": {
+   "x": 0.3607,
+   "y": 0.0507,
+   "w": 0.3802,
+   "h": 0.3802
   }
  }
 }

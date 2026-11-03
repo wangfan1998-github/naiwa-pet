@@ -51,7 +51,7 @@ enum CLI {
         exit(Link.send(.play, data: Data(clip.utf8)) ? 0 : 1)
     }
 
-    /// 演示一遍所有状态：专注 → 等你批准 → 批准后接着干 → 干完捧腹大笑 → 超长任务笑到打滚
+    /// 演示一遍所有状态：干活（惊鸿一瞥）→ 等你批准 → 批准后接着干 → 干完捧腹大笑 → 超长任务笑到打滚
     static func demo() {
         if !Link.send(.hook, data: Data("{}".utf8)) {
             launch(["run"])
@@ -64,10 +64,10 @@ enum CLI {
             _ = Link.send(.hook, data: try! JSONSerialization.data(withJSONObject: e))
             usleep(useconds_t(wait * 1_000_000))
         }
-        event("UserPromptSubmit", wait: 0.3, "专注：Claude 开始干活")
+        event("UserPromptSubmit", wait: 0.3, "Claude 开始干活：推近成侧脸特写（惊鸿一瞥），隔几秒眨眼")
         event("PreToolUse", wait: 5)
-        event("Notification", ["message": "Claude needs your permission to use Bash"], wait: 5, "等你：放大，惊鸿一瞥")
-        event("PreToolUse", wait: 2.5, "批准了：缩回去接着专注")
+        event("Notification", ["message": "Claude needs your permission to use Bash"], wait: 4, "等你批准：转过来直勾勾看着你")
+        event("PreToolUse", wait: 2.5, "批准了：回到侧脸特写接着干")
         event("Stop", ["naiwa_seconds": 125.0], wait: 6.5, "干完一个活（假装跑了 2 分钟）：捧腹大笑")
         event("UserPromptSubmit", wait: 0.3, "超长任务（假装跑了 15 分钟）：笑到倒地打滚")
         event("PreToolUse", wait: 0.5)
@@ -133,10 +133,6 @@ enum Prefs {
     static var dismissed: Bool {
         get { d.bool(forKey: "dismissed") }
         set { d.set(newValue, forKey: "dismissed") }
-    }
-    static var sound: Bool {
-        get { d.object(forKey: "sound") as? Bool ?? true }
-        set { d.set(newValue, forKey: "sound") }
     }
     /// 一轮跑满这么多秒、并且动过工具，才算干完一个活（捧腹大笑）
     static var bigSeconds: Double { d.object(forKey: "bigSeconds") as? Double ?? 60 }

@@ -1,12 +1,12 @@
 import AppKit
 
 let usage = """
-naiwa — 桌面上的奶蛙：Claude 干活时它专注，等你批准时它放大瞥你一眼，干完一个活它捧腹大笑。
+naiwa — 桌面上的奶蛙：Claude 干活时推近成侧脸特写（惊鸿一瞥），等你批准时转过来盯着你，干完一个活捧腹大笑。
 
 用法：
   naiwa                 把奶蛙放到桌面上（已经在了就什么都不做）
   naiwa laugh           让它笑一下；没开着会自动打开（你从菜单退出过就不会）
-  naiwa demo            演示一遍：专注 → 等你批准（放大瞥你）→ 干完大笑 → 超长任务笑到打滚
+  naiwa demo            演示一遍：干活（惊鸿一瞥）→ 等你批准 → 干完大笑 → 超长任务笑到打滚
   naiwa play roll       笑到倒地打滚（也可以 play laugh）
   naiwa quit            让它离开
   naiwa hooks install   接入 Claude Code
