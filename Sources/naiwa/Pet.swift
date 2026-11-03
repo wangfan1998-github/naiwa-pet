@@ -1,127 +1,185 @@
 import AppKit
 import AVFoundation
 
-/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗。
-/// 平时就是一张静止的站姿图（不跑定时器，不占 CPU）。笑的时候播一遍带透明通道的 HEVC 视频：
-/// 系统硬件解码，这边只在播放的几秒里按帧取出来贴到图层上，播完换回站姿。
+/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗。画面全部来自原版《奶蛙大笑》的几段片段：
+///   空闲：侧身站着不动（不跑任何定时器）
+///   专注：有 Claude 会话在干活时，侧身盯着前方，隔几秒眨一下眼
+///   等你：有会话在等你批准，窗口放大，一下子转过来看着你（惊鸿一瞥），头顶冒「等你批准 Bash」，处理完缩回去
+///   笑：干完一个活捧腹大笑，超长任务笑到倒地打滚，头顶冒「项目 做完了 · 时长」；摸它、点它也会笑
+/// 优先级：笑 > 等你 > 专注 > 空闲。笑不会被打断，笑完再回到当时该有的状态。
 final class Pet {
     static var shared: Pet?
+    static let zoomScale: CGFloat = 1.6
 
-    let assets: Assets
     let panel: PetPanel
     let view: PetView
-    private var idle: CGImage?
-    private let video: AVPlayer
-    private let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-    private var sound: AVAudioPlayer?
-    private var timer: Timer?
-    private var laughStart: CFTimeInterval?
-    private var duration: Double = 4
+    private let clips: [String: ClipPlayer]
+    private let sessions = Sessions()
+    private let bubble = Bubble()
+    private var playing: (name: String, player: ClipPlayer, important: Bool, start: CFTimeInterval)?
+    private var frameTimer: Timer?
+    private var blinkTimer: Timer?
+    private var zoomed = false
+    private var restoreFrame: NSRect?
+    private var glanceHeld = false
+    private var bubbleIsWaiting = false
 
     init(assets: Assets) {
-        self.assets = assets
-        let item = AVPlayerItem(url: assets.video)
-        item.add(output)
-        video = AVPlayer(playerItem: item)
-        video.actionAtItemEnd = .pause
-        video.preventsDisplaySleepDuringVideoPlayback = false
-        video.isMuted = true
+        clips = assets.clips.mapValues { ClipPlayer($0, fps: assets.fps) }
         panel = PetPanel(size: Prefs.size)
         view = PetView(frame: NSRect(x: 0, y: 0, width: Prefs.size, height: Prefs.size))
         view.pet = self
         panel.contentView = view
-        if let url = assets.sound {
-            sound = try? AVAudioPlayer(contentsOf: url)
-            sound?.volume = 0.8
-            sound?.prepareToPlay()
-        }
-        Task { [weak self] in
-            if let d = try? await item.asset.load(.duration), d.seconds > 0 { self?.duration = d.seconds }
-        }
-        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-            self?.finishLaugh()
-        }
         // 透明的地方要让鼠标穿过去：窗口默认不接鼠标，指针移到奶蛙身上才接
         NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in self?.updatePassThrough() }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in self?.placeOnScreen() }
     }
 
-    /// 站姿用视频第一帧，和笑的时候走同一条解码路径（单独存 PNG 的话两边颜色会差几个色阶，开始笑时会跳一下）
     func show() {
         Task { @MainActor in
-            idle = await Self.firstFrame(of: assets.video)
-            view.image = idle
+            await clips["focus"]?.loadStills()
+            await clips["glance"]?.loadStills()
             placeOnScreen()
             panel.orderFrontRegardless()
+            render()
         }
     }
 
-    private static func firstFrame(of url: URL) async -> CGImage? {
-        let asset = AVURLAsset(url: url)
-        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
-              let reader = try? AVAssetReader(asset: asset) else { return nil }
-        let out = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-        reader.add(out)
-        reader.startReading()
-        defer { reader.cancelReading() }
-        guard let sample = out.copyNextSampleBuffer(), let pb = CMSampleBufferGetImageBuffer(sample) else { return nil }
-        return image(from: pb)
-    }
-
-    func handle(_ msg: Link.Message) {
+    func handle(_ msg: Link.Message, _ data: Data?) {
         switch msg {
         case .laugh: laugh()
         case .quit: NSApp.terminate(nil)
+        case .play: celebrate(data.flatMap { String(data: $0, encoding: .utf8) } ?? "laugh", text: nil)
+        case .hook: hook(data)
         }
     }
 
-    // MARK: 笑
+    func laugh() { celebrate("laugh", text: nil) }
 
-    func laugh() {
+
+    private func hook(_ data: Data?) {
+        guard let data, let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let f = sessions.handle(e), f.tier != .none {
+            celebrate(f.tier == .huge ? "roll" : "laugh", text: "\(f.project) 做完了 · \(Sessions.duration(f.seconds))")
+        }
+        render()
+    }
+
+    // MARK: 片段
+
+    private func celebrate(_ name: String, text: String?) {
+        guard let c = clips[name] else { return }
         // 正在笑就不打断，快笑完了再来一次就从头笑
-        if let s = laughStart, CACurrentMediaTime() - s < duration * 0.8 { return }
-        laughStart = CACurrentMediaTime()
-        video.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in self?.video.play() }
-        if timer == nil {
-            let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
+        if let p = playing, p.important, CACurrentMediaTime() - p.start < p.player.duration * 0.8 { return }
+        if let text {
+            bubbleIsWaiting = false
+            bubble.show(text, above: panel.frame, for: c.duration + 1.5)
+        }
+        play(name, important: true, sound: true)
+    }
+
+    private func play(_ name: String, important: Bool, sound: Bool, then: (() -> Void)? = nil) {
+        guard let c = clips[name] else { return }
+        playing?.player.stop()
+        blinkTimer?.invalidate()
+        blinkTimer = nil
+        playing = (name, c, important, CACurrentMediaTime())
+        if frameTimer == nil {
+            let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                if let img = self?.playing?.player.nextFrame() { self?.view.show(img) }
+            }
             RunLoop.main.add(t, forMode: .common)
-            timer = t
+            frameTimer = t
         }
-        if Prefs.sound, let p = sound {
-            p.stop()
-            p.currentTime = 0
-            p.play(atTime: p.deviceCurrentTime + assets.audioDelay)
+        c.play(withSound: sound && Prefs.sound) { [weak self] in
+            guard let self, self.playing?.player === c else { return }
+            self.playing = nil
+            self.frameTimer?.invalidate()
+            self.frameTimer = nil
+            if let then { then() } else { self.render() }
         }
     }
 
-    private func tick() {
-        let t = output.itemTime(forHostTime: CACurrentMediaTime())
-        guard output.hasNewPixelBuffer(forItemTime: t),
-              let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil),
-              let img = Self.image(from: pb) else { return }
-        view.show(img)
+    /// 按当前状态摆好奶蛙。正在笑就等笑完（笑完会再调一次）
+    private func render() {
+        if let p = playing, p.important { return }
+        let mood = sessions.mood
+        if mood == .waiting {
+            if let t = sessions.waitingText, bubble.text != t || !bubbleIsWaiting {
+                bubbleIsWaiting = true
+                bubble.show(t, above: zoomed ? panel.frame : zoomTarget(true))
+            }
+            if !zoomed { zoom(true) }
+            if !glanceHeld {
+                glanceHeld = true
+                play("glance", important: false, sound: false) { [weak self] in self?.view.show(self?.clips["glance"]?.last) }
+            }
+            return
+        }
+        if glanceHeld || zoomed {
+            glanceHeld = false
+            if let p = playing, p.name == "glance" {
+                p.player.stop()
+                playing = nil
+                frameTimer?.invalidate()
+                frameTimer = nil
+            }
+            zoom(false)
+        }
+        if bubbleIsWaiting {
+            bubbleIsWaiting = false
+            bubble.hide()
+        }
+        if playing == nil { view.show(clips["focus"]?.first) }
+        if mood == .working {
+            scheduleBlink()
+        } else {
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+        }
     }
 
-    private func finishLaugh() {
-        timer?.invalidate()
-        timer = nil
-        laughStart = nil
-        view.show(idle)  // 和原片开笑一样硬切回站姿：淡入会把两个姿势叠出重影
-        video.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+    /// 专注的时候隔几秒眨一下眼
+    private func scheduleBlink() {
+        guard blinkTimer == nil else { return }
+        blinkTimer = Timer.scheduledTimer(withTimeInterval: .random(in: 2.5...5.5), repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.blinkTimer = nil
+            if self.playing == nil, self.sessions.mood == .working {
+                self.play("focus", important: false, sound: false)
+            } else {
+                self.render()
+            }
+        }
     }
 
-    /// 解码出来的 BGRA 帧（预乘 alpha）→ CGImage。复制一份，像素缓冲马上还给解码器
-    private static func image(from pb: CVPixelBuffer) -> CGImage? {
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
-        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
-        guard let provider = CGDataProvider(data: Data(bytes: base, count: bpr * h) as CFData) else { return nil }
-        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bpr,
-                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                       bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue),
-                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+    // MARK: 放大（惊鸿一瞥）
+
+    /// 放大后的位置：脚底中点不动，放不下就往屏幕里挪
+    private func zoomTarget(_ on: Bool) -> NSRect {
+        if !on, let r = restoreFrame { return r }
+        let side = on ? Prefs.size * Self.zoomScale : Prefs.size
+        let f = panel.frame
+        var r = NSRect(x: f.midX - side / 2, y: f.minY, width: side, height: side)
+        if let vf = (panel.screen ?? NSScreen.main)?.visibleFrame {
+            r.origin.x = min(max(r.minX, vf.minX), vf.maxX - side)
+            r.origin.y = min(max(r.minY, vf.minY), vf.maxY - side)
+        }
+        return r
+    }
+
+    private func zoom(_ on: Bool) {
+        guard zoomed != on else { return }
+        let target = zoomTarget(on)
+        restoreFrame = on ? panel.frame : nil
+        zoomed = on
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = on ? 0.3 : 0.22
+            ctx.timingFunction = CAMediaTimingFunction(name: on ? .easeOut : .easeInEaseOut)
+            panel.animator().setFrame(target, display: true)
+            bubble.follow(target, animated: true)
+        }
     }
 
     // MARK: 位置和鼠标
@@ -145,18 +203,36 @@ final class Pet {
         panel.setFrame(NSRect(origin: origin ?? .zero, size: CGSize(width: size, height: size)), display: true)
     }
 
+    /// 拖动结束：记住没放大时的位置（脚底中点）
+    func savePosition() {
+        let f = panel.frame
+        Prefs.origin = NSPoint(x: f.midX - Prefs.size / 2, y: f.minY)
+        if zoomed { restoreFrame = NSRect(origin: Prefs.origin!, size: CGSize(width: Prefs.size, height: Prefs.size)) }
+    }
+
+    func followBubble() { bubble.follow(panel.frame, animated: false) }
+
     func resize(to size: CGFloat) {
+        if zoomed {
+            zoomed = false
+            glanceHeld = false
+            if let r = restoreFrame { panel.setFrame(r, display: true) }
+            restoreFrame = nil
+        }
         // 脚底中点不动
         let f = panel.frame
         let origin = NSPoint(x: f.midX - size / 2, y: f.minY)
         Prefs.size = size
         Prefs.origin = origin
         panel.setFrame(NSRect(origin: origin, size: CGSize(width: size, height: size)), display: true)
+        followBubble()
+        render()
     }
 
     func menu() -> NSMenu {
         let m = NSMenu()
         m.addItem(item("笑一下") { [weak self] in self?.laugh() })
+        m.addItem(item("笑到打滚") { [weak self] in self?.celebrate("roll", text: nil) })
         let sound = item("笑声") { Prefs.sound.toggle() }
         sound.state = Prefs.sound ? .on : .off
         m.addItem(sound)
@@ -276,12 +352,13 @@ final class PetView: NSView {
         if !dragging, hypot(m.x - downAt.x, m.y - downAt.y) < 3 { return }
         dragging = true
         window?.setFrameOrigin(NSPoint(x: downOrigin.x + m.x - downAt.x, y: downOrigin.y + m.y - downAt.y))
+        pet?.followBubble()
     }
 
     override func mouseUp(with event: NSEvent) {
         if dragging {
             dragging = false
-            Prefs.origin = window?.frame.origin
+            pet?.savePosition()
             pet?.updatePassThrough()
         } else {
             pet?.laugh()

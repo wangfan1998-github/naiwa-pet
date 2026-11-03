@@ -6,25 +6,29 @@ enum Link {
     enum Message: Int32 {
         case laugh = 1
         case quit = 2
+        case hook = 3   // 数据：Claude Code hook 的输入 JSON
+        case play = 4   // 数据：片段名（laugh / roll）
     }
 
     static let portName = "com.nwverse.naiwa" as CFString
-    private static var handler: ((Message) -> Void)?
+    private static var handler: ((Message, Data?) -> Void)?
     private static var port: CFMessagePort?
 
     /// 发给正在跑的奶蛙；没有在跑就返回 false。
-    static func send(_ msg: Message) -> Bool {
+    static func send(_ msg: Message, data: Data? = nil) -> Bool {
         guard let remote = CFMessagePortCreateRemote(nil, portName) else { return false }
-        return CFMessagePortSendRequest(remote, msg.rawValue, nil, 1, 0, nil, nil) == kCFMessagePortSuccess
+        return CFMessagePortSendRequest(remote, msg.rawValue, data as CFData?, 1, 0, nil, nil) == kCFMessagePortSuccess
     }
 
     /// 注册端口；名字被占了（已经有一只）返回 false。
-    static func listen(handler: @escaping (Message) -> Void) -> Bool {
+    static func listen(handler: @escaping (Message, Data?) -> Void) -> Bool {
         self.handler = handler
         var ctx = CFMessagePortContext()
-        guard let local = CFMessagePortCreateLocal(nil, portName, { _, id, _, _ in
+        guard let local = CFMessagePortCreateLocal(nil, portName, { _, id, data, _ in
             if let msg = Link.Message(rawValue: id) {
-                DispatchQueue.main.async { Link.handler?(msg) }
+                // CFMessagePort 给的数据只在回调期间有效，必须当场复制一份再丢到主线程
+                let payload = data.map { Data(bytes: CFDataGetBytePtr($0), count: CFDataGetLength($0)) }
+                DispatchQueue.main.async { Link.handler?(msg, payload) }
             }
             return nil
         }, &ctx, nil) else { return false }
@@ -40,6 +44,51 @@ enum CLI {
         // 用户从菜单里让它走了，就别被下一个任务又叫回来
         if Prefs.dismissed { exit(0) }
         launch(["run", "--laugh"])
+        exit(0)
+    }
+
+    static func play(_ clip: String) {
+        exit(Link.send(.play, data: Data(clip.utf8)) ? 0 : 1)
+    }
+
+    /// 演示一遍所有状态：专注 → 等你批准 → 批准后接着干 → 干完捧腹大笑 → 超长任务笑到打滚
+    static func demo() {
+        if !Link.send(.hook, data: Data("{}".utf8)) {
+            launch(["run"])
+            for _ in 0..<20 where !Link.send(.hook, data: Data("{}".utf8)) { usleep(100_000) }
+        }
+        let cwd = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("naiwa-demo").path
+        func event(_ name: String, _ extra: [String: Any] = [:], wait: Double, _ note: String = "") {
+            if !note.isEmpty { print(note) }
+            let e = ["hook_event_name": name, "session_id": "naiwa-demo", "cwd": cwd].merging(extra) { $1 }
+            _ = Link.send(.hook, data: try! JSONSerialization.data(withJSONObject: e))
+            usleep(useconds_t(wait * 1_000_000))
+        }
+        event("UserPromptSubmit", wait: 0.3, "专注：Claude 开始干活")
+        event("PreToolUse", wait: 5)
+        event("Notification", ["message": "Claude needs your permission to use Bash"], wait: 5, "等你：放大，惊鸿一瞥")
+        event("PreToolUse", wait: 2.5, "批准了：缩回去接着专注")
+        event("Stop", ["naiwa_seconds": 125.0], wait: 6.5, "干完一个活（假装跑了 2 分钟）：捧腹大笑")
+        event("UserPromptSubmit", wait: 0.3, "超长任务（假装跑了 15 分钟）：笑到倒地打滚")
+        event("PreToolUse", wait: 0.5)
+        event("Stop", ["naiwa_seconds": 900.0], wait: 0)
+        event("SessionEnd", wait: 0)
+    }
+
+    /// Claude Code 的 hook：把 stdin 里的事件 JSON 原样转给奶蛙，由它记账、决定反应。
+    /// 必须快、不输出任何东西、永远返回 0，不能拖慢或干扰 Claude。
+    static func hook() {
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        if Link.send(.hook, data: data) { exit(0) }
+        // 奶蛙没开着：只在新一轮开始时把它叫出来（让它走过就不叫），不然这一轮没有开始时间，记不了账
+        guard !Prefs.dismissed,
+              let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              e["hook_event_name"] as? String == "UserPromptSubmit" else { exit(0) }
+        launch(["run"])
+        for _ in 0..<20 {
+            usleep(100_000)
+            if Link.send(.hook, data: data) { break }
+        }
         exit(0)
     }
 
@@ -89,6 +138,10 @@ enum Prefs {
         get { d.object(forKey: "sound") as? Bool ?? true }
         set { d.set(newValue, forKey: "sound") }
     }
+    /// 一轮跑满这么多秒、并且动过工具，才算干完一个活（捧腹大笑）
+    static var bigSeconds: Double { d.object(forKey: "bigSeconds") as? Double ?? 60 }
+    /// 跑满这么多秒算超长任务（笑到倒地打滚）
+    static var hugeSeconds: Double { d.object(forKey: "hugeSeconds") as? Double ?? 600 }
     static var size: CGFloat {
         get { d.object(forKey: "size") as? CGFloat ?? 110 }
         set { d.set(newValue, forKey: "size") }

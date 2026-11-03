@@ -1,0 +1,23 @@
+{
+ "fps": 30,
+ "clips": {
+  "focus": {
+   "video": "focus.mov",
+   "frames": 33
+  },
+  "glance": {
+   "video": "glance.mov",
+   "frames": 7
+  },
+  "laugh": {
+   "video": "laugh.mov",
+   "frames": 122,
+   "sound": "laugh.m4a"
+  },
+  "roll": {
+   "video": "roll.mov",
+   "frames": 221,
+   "sound": "roll.m4a"
+  }
+ }
+}

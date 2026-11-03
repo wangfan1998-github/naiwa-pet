@@ -1,17 +1,21 @@
 import AppKit
 
 let usage = """
-naiwa — 桌面上的奶蛙，摸它、或者任务做完，它就捧腹大笑。
+naiwa — 桌面上的奶蛙：Claude 干活时它专注，等你批准时它放大瞥你一眼，干完一个活它捧腹大笑。
 
 用法：
   naiwa                 把奶蛙放到桌面上（已经在了就什么都不做）
   naiwa laugh           让它笑一下；没开着会自动打开（你从菜单退出过就不会）
+  naiwa demo            演示一遍：专注 → 等你批准（放大瞥你）→ 干完大笑 → 超长任务笑到打滚
+  naiwa play roll       笑到倒地打滚（也可以 play laugh）
   naiwa quit            让它离开
-  naiwa hooks install   接入 Claude Code：每次任务做完就笑
-  naiwa hooks uninstall 撤掉上面那条
+  naiwa hooks install   接入 Claude Code
+  naiwa hooks uninstall 撤掉接入
   naiwa hooks           打印 Claude Code / Codex 的接入配置
+  naiwa hook            （给 Claude Code 的 hook 调用，从 stdin 读事件）
 
 在奶蛙身上：点一下或来回摸几下 = 笑；拖动 = 换位置；右键 = 菜单。
+一轮跑满 60 秒且动过工具才笑，满 10 分钟笑到打滚：defaults write com.nwverse.naiwa bigSeconds -float 30
 """
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -24,6 +28,12 @@ case "laugh":
     CLI.laugh()
 case "quit":
     exit(Link.send(.quit) ? 0 : 1)
+case "play":
+    CLI.play(args.dropFirst().first ?? "laugh")
+case "hook":
+    CLI.hook()
+case "demo":
+    CLI.demo()
 case "hooks":
     Hooks.main(Array(args.dropFirst()))
 case "-h", "--help", "help":
@@ -36,7 +46,7 @@ default:
 func runPet(laughOnStart: Bool) {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
-    guard Link.listen(handler: { msg in Pet.shared?.handle(msg) }) else {
+    guard Link.listen(handler: { msg, data in Pet.shared?.handle(msg, data) }) else {
         // 已经有一只在桌面上了
         if laughOnStart { _ = Link.send(.laugh) }
         exit(0)

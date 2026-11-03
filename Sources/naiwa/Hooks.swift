@@ -1,10 +1,16 @@
 import Foundation
 
-/// 接入 Claude Code：在 ~/.claude/settings.json 的 hooks.Stop 里加一条 `naiwa laugh`。
+/// 接入 Claude Code：在 ~/.claude/settings.json 的 hooks 里，给下面几个事件各加一条 `naiwa hook`。
+/// 奶蛙拿到事件自己记账：谁在干活、谁在等你批准、一轮跑了多久、动没动工具。
 ///
-/// 只在原文里插入一小段文本，不整体重写，免得把用户的格式和键顺序打乱；
-/// 写之前解析新旧两份，确认除了这一条以外完全一样才落盘，并留一份备份。
+/// 只在原文里插入文本，不整体重写，免得把用户的格式和键顺序打乱；
+/// 写之前解析新旧两份，确认除了这几条以外完全一样才落盘，并留一份备份。
 enum Hooks {
+    static let events: [(name: String, matcher: Bool)] = [
+        ("UserPromptSubmit", false), ("PreToolUse", true), ("PostToolUse", true),
+        ("Notification", false), ("Stop", false), ("SessionEnd", false),
+    ]
+
     static func main(_ args: [String]) {
         do {
             switch args.first {
@@ -25,37 +31,53 @@ enum Hooks {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
     }
 
-    /// 写进钩子里的命令：优先用 PATH 上的 naiwa，找不到就用当前可执行文件的绝对路径
-    static var command: String {
+    /// PATH 上的 naiwa，找不到就用当前可执行文件的绝对路径
+    static var binary: String {
         let path = ProcessInfo.processInfo.environment["PATH"]?.split(separator: ":")
             .map { URL(fileURLWithPath: String($0)).appendingPathComponent("naiwa").path }
             .first { FileManager.default.isExecutableFile(atPath: $0) }
             ?? URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
-        let quoted = path.contains(" ") ? "'\(path)'" : path
-        return "\(quoted) laugh"
+        return path.contains(" ") ? "'\(path)'" : path
     }
 
-    static var entry: String {
+    static var command: String { "\(binary) hook" }
+
+    static func entry(matcher: Bool) -> String {
         let cmd = String(data: try! JSONSerialization.data(withJSONObject: [command], options: [.withoutEscapingSlashes]), encoding: .utf8)!
             .dropFirst().dropLast()
-        return #"{"hooks": [{"type": "command", "command": \#(cmd)}]}"#
+        let hooks = #""hooks": [{"type": "command", "command": \#(cmd)}]"#
+        return matcher ? #"{"matcher": "*", \#(hooks)}"# : "{\(hooks)}"
     }
+
+    /// 我们插进去的条目（含旧版只在 Stop 里放的 `naiwa laugh`），后面紧跟的逗号一起去掉
+    static let ours = #"\{("matcher": "\*", )?"hooks": \[\{"type": "command", "command": "[^"]*naiwa (hook|laugh)"\}\]\},?"#
 
     static func install() throws {
         let fm = FileManager.default
-        let text = (try? String(contentsOf: settings, encoding: .utf8)) ?? "{}\n"
+        let original = (try? String(contentsOf: settings, encoding: .utf8)) ?? "{}\n"
+        // 先去掉旧的（包括旧版的 `naiwa laugh`），再整套重新装
+        let text = original.replacingOccurrences(of: ours, with: "", options: .regularExpression)
         let old = try parse(text)
-        if isInstalled(old) {
-            print("已经接入过了：\(settings.path)")
-            return
+        guard !containsOurs(old) else {
+            throw Failure("settings.json 被重新排版过，找不到原样的旧条目。请先手动删掉 hooks 里含 `naiwa` 的条目再装")
         }
-        guard let new = insert(into: text) else { throw Failure("没找到能插入的位置，请手动加，见 `naiwa hooks`") }
+        var new = text
+        var expectedHooks = old["hooks"] as? [String: Any] ?? [:]
+        for e in events {
+            guard let next = insert(entry(matcher: e.matcher), event: e.name, into: new) else {
+                throw Failure("没找到能插入的位置，请手动加，见 `naiwa hooks`")
+            }
+            new = next
+            expectedHooks[e.name] = [try parse(entry(matcher: e.matcher))] + (expectedHooks[e.name] as? [Any] ?? [])
+        }
         var expected = old
-        var hooks = expected["hooks"] as? [String: Any] ?? [:]
-        hooks["Stop"] = [try parse(entry)] + (hooks["Stop"] as? [Any] ?? [])
-        expected["hooks"] = hooks
+        expected["hooks"] = expectedHooks
         guard NSDictionary(dictionary: try parse(new)).isEqual(to: expected) else {
             throw Failure("插入后内容和预期不一致，没有写入。请手动加，见 `naiwa hooks`")
+        }
+        if new == original {
+            print("已经接入过了：\(settings.path)")
+            return
         }
         try fm.createDirectory(at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
         if fm.fileExists(atPath: settings.path) {
@@ -64,48 +86,57 @@ enum Hooks {
             try fm.copyItem(atPath: settings.path, toPath: backup)
         }
         try new.write(to: settings, atomically: true, encoding: .utf8)
-        print("已接入 Claude Code：每次任务做完，奶蛙捧腹大笑。\n  \(settings.path) → hooks.Stop 加了 `\(command)`（原文件备份在 .bak-naiwa）")
+        print("""
+        已接入 Claude Code：\(settings.path)
+          \(events.map(\.name).joined(separator: "、")) 各加了一条 `\(command)`（原文件备份在 .bak-naiwa）
+          新开的 Claude Code 会话生效；已经开着的要重开
+        """)
     }
 
     static func uninstall() throws {
         let text = try String(contentsOf: settings, encoding: .utf8)
-        let old = try parse(text)
-        guard isInstalled(old) else {
+        guard containsOurs(try parse(text)) else {
             print("没有接入过")
             return
         }
-        for candidate in [entry + ",", entry] where text.contains(candidate) {
-            let new = text.replacingOccurrences(of: candidate, with: "")
-            if let parsed = try? parse(new), !isInstalled(parsed) {
-                try new.write(to: settings, atomically: true, encoding: .utf8)
-                print("已撤掉：\(settings.path)")
-                return
-            }
+        var new = text.replacingOccurrences(of: ours, with: "", options: .regularExpression)
+        // 撤掉后剩下的空数组一起去掉（多是安装时新建的；空数组和没有这个键效果一样）
+        for e in events {
+            new = new.replacingOccurrences(of: #""\#(e.name)": \[\],?"#, with: "", options: .regularExpression)
         }
-        throw Failure("settings.json 被重新排版过，找不到原样那一段。请手动删掉 hooks.Stop 里含 `naiwa laugh` 的那条")
+        guard let parsed = try? parse(new), !containsOurs(parsed) else {
+            throw Failure("settings.json 被重新排版过，找不到原样那几段。请手动删掉 hooks 里含 `naiwa` 的条目")
+        }
+        try new.write(to: settings, atomically: true, encoding: .utf8)
+        print("已撤掉：\(settings.path)")
     }
 
-    /// 在 hooks.Stop 数组开头插入；没有 Stop 就在 hooks 里加；没有 hooks 就在最外层加
-    static func insert(into text: String) -> String? {
+    /// 在 hooks.<event> 数组开头插入；没有这个事件就在 hooks 里加；没有 hooks 就在最外层加
+    static func insert(_ entry: String, event: String, into text: String) -> String? {
         func sep(after i: String.Index, close: Character) -> String {
             text[i...].first { !$0.isWhitespace } == close ? "" : ","
         }
         if let hooks = text.range(of: #""hooks"\s*:\s*\{"#, options: .regularExpression) {
-            if let stop = text.range(of: #""Stop"\s*:\s*\["#, options: .regularExpression, range: hooks.upperBound..<text.endIndex) {
-                return text.replacingCharacters(in: stop.upperBound..<stop.upperBound, with: entry + sep(after: stop.upperBound, close: "]"))
+            if let list = text.range(of: #""\#(event)"\s*:\s*\["#, options: .regularExpression, range: hooks.upperBound..<text.endIndex) {
+                return text.replacingCharacters(in: list.upperBound..<list.upperBound, with: entry + sep(after: list.upperBound, close: "]"))
             }
             return text.replacingCharacters(in: hooks.upperBound..<hooks.upperBound,
-                                            with: #""Stop": ["# + entry + "]" + sep(after: hooks.upperBound, close: "}"))
+                                            with: #""\#(event)": ["# + entry + "]" + sep(after: hooks.upperBound, close: "}"))
         }
         guard let brace = text.firstIndex(of: "{") else { return nil }
         let at = text.index(after: brace)
-        return text.replacingCharacters(in: at..<at, with: #""hooks": {"Stop": ["# + entry + "]}" + sep(after: at, close: "}"))
+        return text.replacingCharacters(in: at..<at, with: #""hooks": {"\#(event)": ["# + entry + "]}" + sep(after: at, close: "}"))
     }
 
-    static func isInstalled(_ settings: [String: Any]) -> Bool {
-        let stop = (settings["hooks"] as? [String: Any])?["Stop"] as? [[String: Any]] ?? []
-        return stop.contains { group in
-            (group["hooks"] as? [[String: Any]] ?? []).contains { ($0["command"] as? String)?.contains("naiwa") == true && ($0["command"] as? String)?.hasSuffix(" laugh") == true }
+    static func containsOurs(_ settings: [String: Any]) -> Bool {
+        let hooks = settings["hooks"] as? [String: Any] ?? [:]
+        return hooks.values.contains { groups in
+            (groups as? [[String: Any]] ?? []).contains { group in
+                (group["hooks"] as? [[String: Any]] ?? []).contains {
+                    guard let c = $0["command"] as? String else { return false }
+                    return c.contains("naiwa") && (c.hasSuffix(" hook") || c.hasSuffix(" laugh"))
+                }
+            }
         }
     }
 
@@ -117,12 +148,15 @@ enum Hooks {
     }
 
     static func printSnippets() {
+        let lines = events.map { "    \"\($0.name)\": [ \(entry(matcher: $0.matcher)) ]" }.joined(separator: ",\n")
         print("""
         Claude Code（~/.claude/settings.json，或者直接 `naiwa hooks install`）：
-          "hooks": { "Stop": [ \(entry) ] }
+          "hooks": {
+        \(lines)
+          }
 
         Codex（~/.codex/config.toml 最上面，[xxx] 表之前；已经有 notify 的话只能留一个）：
-          notify = ["\(command.replacingOccurrences(of: " laugh", with: "").replacingOccurrences(of: "'", with: ""))", "laugh"]
+          notify = ["\(binary.replacingOccurrences(of: "'", with: ""))", "laugh"]
 
         其他任何命令行：长任务后面接一句
           make build; naiwa laugh

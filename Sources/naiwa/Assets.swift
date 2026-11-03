@@ -1,23 +1,33 @@
 import AppKit
+import AVFoundation
 
-/// 素材目录：
-///   laugh.json  {"audioDelay": 0.28}
-///   laugh.mov   捧腹大笑，带透明通道的 HEVC；第一帧和最后一帧都是平时站着的样子
-///   laugh.m4a   笑声
+/// 素材目录（scripts/make_assets.py 生成）：
+///   assets.json  {"fps": 30, "clips": {"laugh": {"video": "laugh.mov", "sound": "laugh.m4a", "frames": 122}, …}}
+///   *.mov        带透明通道的 HEVC：focus 专注 / glance 惊鸿一瞥 / laugh 捧腹大笑 / roll 笑到打滚
+///   *.m4a        对应的原声
 struct Assets {
-    let dir: URL
-    let audioDelay: Double
-    var video: URL { dir.appendingPathComponent("laugh.mov") }
-    var sound: URL? {
-        let u = dir.appendingPathComponent("laugh.m4a")
-        return FileManager.default.fileExists(atPath: u.path) ? u : nil
+    struct Clip {
+        let video: URL
+        let sound: URL?
+        let frames: Int
     }
 
+    let fps: Double
+    let clips: [String: Clip]
+
     static func load() -> Assets? {
-        for dir in candidates() where FileManager.default.fileExists(atPath: dir.appendingPathComponent("laugh.mov").path) {
-            let meta = (try? Data(contentsOf: dir.appendingPathComponent("laugh.json")))
-                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
-            return Assets(dir: dir, audioDelay: meta["audioDelay"] as? Double ?? 0)
+        for dir in candidates() {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("assets.json")),
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let list = j["clips"] as? [String: [String: Any]] else { continue }
+            var clips: [String: Clip] = [:]
+            for (name, c) in list {
+                guard let video = c["video"] as? String else { continue }
+                clips[name] = Clip(video: dir.appendingPathComponent(video),
+                                   sound: (c["sound"] as? String).map { dir.appendingPathComponent($0) },
+                                   frames: c["frames"] as? Int ?? 0)
+            }
+            if clips["laugh"] != nil { return Assets(fps: j["fps"] as? Double ?? 30, clips: clips) }
         }
         return nil
     }
@@ -37,5 +47,94 @@ struct Assets {
             dir.deleteLastPathComponent()
         }
         return out
+    }
+}
+
+/// 一段片段的播放器：系统硬件解码视频，播放时按帧取出 CGImage 交给图层；可以带一段原声。
+final class ClipPlayer {
+    let duration: Double
+    private let url: URL
+    private let item: AVPlayerItem
+    private let player: AVPlayer
+    private let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+    private var sound: AVAudioPlayer?
+    private var onEnd: (() -> Void)?
+    /// 第一帧和最后一帧（站姿、惊鸿一瞥停住的那一眼），和播放走同一条解码路径，切过去颜色不会跳
+    private(set) var first: CGImage?
+    private(set) var last: CGImage?
+
+    init(_ clip: Assets.Clip, fps: Double) {
+        url = clip.video
+        duration = Double(clip.frames) / fps
+        item = AVPlayerItem(url: clip.video)
+        item.add(output)
+        player = AVPlayer(playerItem: item)
+        player.actionAtItemEnd = .pause
+        player.isMuted = true
+        player.preventsDisplaySleepDuringVideoPlayback = false
+        if let s = clip.sound {
+            sound = try? AVAudioPlayer(contentsOf: s)
+            sound?.volume = 0.8
+            sound?.prepareToPlay()
+        }
+        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            let done = self?.onEnd
+            self?.onEnd = nil
+            done?()
+        }
+    }
+
+    func play(withSound: Bool, onEnd: @escaping () -> Void) {
+        self.onEnd = onEnd
+        player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in self?.player.play() }
+        if withSound, let s = sound {
+            s.stop()
+            s.currentTime = 0
+            s.play()
+        }
+    }
+
+    func stop() {
+        onEnd = nil
+        player.pause()
+        sound?.stop()
+    }
+
+    /// 当前该显示的新帧；没有新帧返回 nil
+    func nextFrame() -> CGImage? {
+        let t = output.itemTime(forHostTime: CACurrentMediaTime())
+        guard output.hasNewPixelBuffer(forItemTime: t),
+              let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil) else { return nil }
+        return Self.image(from: pb)
+    }
+
+    func loadStills() async {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let reader = try? AVAssetReader(asset: asset) else { return }
+        let out = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        reader.add(out)
+        reader.startReading()
+        var firstImage: CGImage?, lastImage: CGImage?
+        while let sample = out.copyNextSampleBuffer() {
+            guard let pb = CMSampleBufferGetImageBuffer(sample) else { continue }
+            lastImage = Self.image(from: pb)
+            if firstImage == nil { firstImage = lastImage }
+        }
+        first = firstImage
+        last = lastImage
+    }
+
+    /// 解码出来的 BGRA 帧（预乘 alpha）→ CGImage。复制一份，像素缓冲马上还给解码器
+    static func image(from pb: CVPixelBuffer) -> CGImage? {
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
+        guard let provider = CGDataProvider(data: Data(bytes: base, count: bpr * h) as CFData) else { return nil }
+        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bpr,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 }
