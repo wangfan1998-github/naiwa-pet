@@ -55,7 +55,11 @@ final class Sessions {
         case "PostToolUse", "PostToolUseFailure":
             s.waiting = nil
         case "Notification":
-            s.waiting = Self.waitingReason(e["message"] as? String ?? "")
+            switch Self.notification(type: e["notification_type"] as? String, message: e["message"] as? String ?? "") {
+            case .waiting(let text): s.waiting = text
+            case .answered: s.waiting = nil
+            case .ignore: break
+            }
         case "Stop":
             // naiwa_seconds：`naiwa demo` 用来假装这一轮跑了多久
             let seconds = e["naiwa_seconds"] as? Double ?? s.start.map { now.timeIntervalSince($0) } ?? 0
@@ -79,15 +83,31 @@ final class Sessions {
         return seconds >= Prefs.hugeSeconds ? .huge : .big
     }
 
-    /// Claude 闲着等你回话 60 秒后也会发 Notification（「waiting for your input」），那不算在等你确认，不然
-    /// 做完的会话放着不管，奶蛙会一直放大盯着你
-    static func waitingReason(_ message: String) -> String? {
-        if message.localizedCaseInsensitiveContains("waiting for your input") { return nil }
-        if let r = message.range(of: #"permission to use (\S+)"#, options: .regularExpression) {
-            let tool = message[r].split(separator: " ").last.map(String.init) ?? ""
-            return "等你批准 \(tool)"
+    enum NotificationKind { case waiting(String), answered, ignore }
+
+    /// 只有真的卡在你身上才算「等你」：要权限、MCP 弹表单问你、后台会话等你回话。
+    /// Claude 说完 60 秒你没理它（idle_prompt）、登录成功之类都不算，不然做完的会话放着不管，奶蛙会一直盯着你。
+    static func notification(type: String?, message: String) -> NotificationKind {
+        switch type {
+        case "permission_prompt":
+            return .waiting(permissionText(message))
+        case "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input":
+            return .waiting("等你回复")
+        case "elicitation_complete", "elicitation_response":
+            return .answered
+        case .some:
+            return .ignore
+        case nil:
+            // 老版本 Claude Code 没有 notification_type：只认明确提到权限的
+            return message.localizedCaseInsensitiveContains("permission") ? .waiting(permissionText(message)) : .ignore
         }
-        return "等你确认"
+    }
+
+    /// 「Claude needs your permission to use Bash」→「等你批准 Bash」
+    static func permissionText(_ message: String) -> String {
+        guard let r = message.range(of: #"permission to use (\S+)"#, options: .regularExpression),
+              let tool = message[r].split(separator: " ").last else { return "等你批准" }
+        return "等你批准 \(tool)"
     }
 
     static func project(_ cwd: String) -> String {

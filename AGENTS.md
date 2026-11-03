@@ -25,7 +25,8 @@ naiwa-pet：macOS 桌面上的奶蛙，Claude Code 干活时推近成侧脸特�
 - macOS 上 `contentsRect` 的原点在图片左下角（y 往上），assets.json 里的特写框原点在左上，换算见 `PetView.setCrop`；命中测试也要按 `contentsRect` 换算。
 - 在 Naiwa.app 里拿自己的 bundle id 当 `UserDefaults(suiteName:)` 会返回 nil。
 - CFMessagePort 回调给的 CFData 只在回调期间有效：必须当场复制再丢到主线程，直接桥接成 `Data` 会读到垃圾。
-- Claude 闲着等回话 60 秒后也发 `Notification`（「waiting for your input」），不能当成「等你批准」。
+- 「等你」只看 `Notification` 的 `notification_type`（`permission_prompt` 等），不要按提示语猜：`idle_prompt` 和别的提醒文案不止一种，按文字过滤漏过一次，奶蛙在没人要权限时显示了「等你确认」。
+- 头部特写只占画面 38%，480P 原片直接推近会糊：特写用到的片段必须走超分（`make_assets.py` 的 `HIRES`）。
 - bash 里变量后面直接跟中文标点要写成 `${VAR}`，否则会被当成变量名的一部分。
 
 ## 分支与提交

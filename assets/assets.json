@@ -3,7 +3,7 @@
  "clips": {
   "focus": {
    "video": "focus.mov",
-   "frames": 33
+   "frames": 19
   },
   "glance": {
    "video": "glance.mov",
@@ -26,8 +26,8 @@
    "h": 0.3802
   },
   "glance": {
-   "x": 0.3607,
-   "y": 0.0507,
+   "x": 0.3626,
+   "y": 0.052,
    "w": 0.3802,
    "h": 0.3802
   }

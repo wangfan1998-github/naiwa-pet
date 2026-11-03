@@ -166,7 +166,7 @@ final class Pet {
     /// 干活的时候隔几秒眨一下眼（片段在当前取景里播，还是侧脸特写）
     private func scheduleBlink() {
         guard blinkTimer == nil else { return }
-        blinkTimer = Timer.scheduledTimer(withTimeInterval: .random(in: 2.5...5.5), repeats: false) { [weak self] _ in
+        blinkTimer = Timer.scheduledTimer(withTimeInterval: .random(in: 3...7), repeats: false) { [weak self] _ in
             guard let self else { return }
             self.blinkTimer = nil
             if self.playing == nil, !self.celebrating, self.sessions.mood == .working {

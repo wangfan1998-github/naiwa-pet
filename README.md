@@ -47,7 +47,7 @@ naiwa demo                  # 演示一遍所有状态
 `naiwa hooks install` 在 `~/.claude/settings.json` 的 `UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Notification`、`Stop`、`SessionEnd` 里各加一条 `naiwa hook`。奶蛙拿到事件自己给每个会话记账：
 
 - 一轮从你发消息算起，`Stop` 时跑满 60 秒、并且调过工具，才算干完一个活；满 600 秒算超长任务。改门槛：`defaults write com.nwverse.naiwa bigSeconds -float 30`（`hugeSeconds` 同理）
-- `Notification` 里的权限请求算「等你」；Claude 闲着等你回话的提醒不算，不然做完的会话放着不管，它会一直放大盯着你
+- 按 `Notification` 的 `notification_type` 判断「等你」：`permission_prompt`（要权限）、`elicitation_dialog`（MCP 弹表单问你）、`agent_needs_input` 算；`idle_prompt`（说完 60 秒你没理它）等其他类型不算，不然做完的会话放着不管，它会一直盯着你
 - 同时开好几个会话也没问题，气泡里写的是哪个项目
 
 只插入这几条，不重排你的配置，原文件备份为 `settings.json.bak-naiwa`；`naiwa hooks uninstall` 撤掉。新开的 Claude Code 会话才生效。
@@ -67,7 +67,8 @@ Codex 在 `~/.codex/config.toml` 最上面加 `notify = ["/Users/你/.local/bin/
 ```
 scripts/fetch_source.sh    从 B 站下载《奶蛙大笑（额外扩展版）》（BV1JBuB6PEMF，480P）
 scripts/make_assets.py     切成四段 → rembg 抠白底 → 统一裁成方形 384px（头顶留空）
-                           → 预乘透明度编成带透明通道的 HEVC（assets/*.mov，合计约 570KB）
+                           → 要推近成特写的两段先用 Real-ESRGAN 放大 4 倍再抠，存 768px
+                           → 预乘透明度编成带透明通道的 HEVC（assets/*.mov，合计约 1.2MB）
                            → 算出侧脸、转头两张特写的取景框写进 assets.json
 ```
 
@@ -79,7 +80,8 @@ scripts/make_assets.py     切成四段 → rembg 抠白底 → 统一裁成方�
 | roll | 2.15–3.90 + 72.0–77.6 秒：开笑后剪到片尾的仰面摔倒、躺地打滚（两段都是仰头大笑的姿势，接得上） | 超长任务 |
 
 - 「惊鸿一瞥」这个梗是镜头推近到奶蛙的侧脸和一只眼睛（比如 B 站「人生若只如初见，惊鸿一瞥」那条，镜头一路推到窗户里奶蛙的侧脸）。这里用原片侧身站姿推近到头部来做，不用另外的素材；推近用图层的 `contentsRect` 动画，窗口大小不变。
-- 四段用同一个裁剪框，切换状态时奶蛙不会忽大忽小。
+- 原片只有 480P，头部特写直接放大会糊：focus、glance 两段先按裁剪框截出原片，用 Real-ESRGAN 的 `realesrgan-x4plus` 放大 4 倍再抠图（anime 系列会给轮廓描黑边，不像原片的软胶质感）。需要 `realesrgan-ncnn-vulkan`，`REALESRGAN` 指向它所在目录。
+- 四段用同一个裁剪框（高清两段和普通两段取景完全一致），切换状态时奶蛙不会忽大忽小。
 - 状态之间除了推拉镜头都是硬切：原片开笑就是硬切，「突然笑、突然停」；淡出会把两个姿势叠出重影。
 - 抠图用 rembg 的 `isnet-general-use`：侧身时奶白肚皮正好在轮廓边上、颜色又接近白底，按颜色泛洪会把肚皮一起吃掉；仰面躺地时也一样。
 - 试过的弯路：视频模型（Seedance）会因为奶蛙造型被内容审核拦掉；自己拿 3D 模型做动作，笑起来不像原梗；带原声太吵。
