@@ -33,7 +33,7 @@
 需要 macOS 13 以上，以及 Command Line Tools（没装的话运行 `xcode-select --install`）。不需要 Xcode。
 
 ```bash
-git clone git@github.com:nwverse/naiwa-pet.git
+git clone git@github.com:wangfan1998-github/naiwa-pet.git
 cd naiwa-pet
 scripts/install.sh       # 编译并装好：~/Applications/Naiwa.app，命令 ~/.local/bin/naiwa，登录时自动出现
 naiwa hooks install      # 接入 Claude Code
