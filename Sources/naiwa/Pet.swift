@@ -1,106 +1,145 @@
 import AppKit
 
-/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗。画面全部来自原版《奶蛙大笑》的几段片段，没有声音：
-///   空闲：全身侧身站着，一动不动（不跑任何定时器）
-///   干活：镜头慢慢推近到侧脸和眼睛的特写（惊鸿一瞥），隔几秒眨一下眼
-///   等你：特写里一下子转过来直勾勾看着你，头顶冒「项目 等你批准 Bash」
-///   做完：拉回全身，干完一个活捧腹大笑，超长任务笑到倒地打滚，头顶冒「项目 做完了 · 时长」；摸它、点它也会笑
-/// 优先级：笑 > 等你 > 干活 > 空闲。笑不会被打断，笑完再回到当时该有的状态。
+/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗。画面是防御老猫画的奶蛙（Seedance 让它动起来、逐帧抠出来），没有声音：
+///   空闲：按一天的时段换一只，在那里慢慢地动（安睡、听歌、悠闲、云幻、封闭、孤独），首尾接上一直循环
+///   干活：沉溺奶蛙，闭着眼悬浮在水里，沉浸在活里
+///   等你：沉溺奶蛙睁开眼转过来看着你，停住，头顶冒「项目 等你批准 Bash」
+///   做完：捧腹大笑，头顶冒「项目 做完了 · 时长」；摸它、点它也会笑
+/// 优先级：笑 > 等你 > 干活 > 空闲。笑不会被打断，笑完再回到当时该有的状态。状态之间硬切（透明的画面叠化会出重影）。
+/// 窗口被挡住、屏幕睡了就停播，不白占 CPU。
 final class Pet {
     static var shared: Pet?
 
-    /// 取景：全身 / 侧脸特写 / 转头看你的特写
-    enum Shot { case full, side, look }
-
     let panel: PetPanel
     let view: PetView
-    private let clips: [String: ClipPlayer]
-    private let closeups: [Shot: CGRect]
+    private let assets: Assets
+    private var schedule: Schedule
+    private var scheduleStamp: Date?   // config.json 的修改时间，变了就重读（手改了文件不用重启）
+    private var clips: [String: ClipPlayer] = [:]
     private let sessions = Sessions()
     private let bubble = Bubble()
-    private var playing: (name: String, player: ClipPlayer, important: Bool, start: CFTimeInterval)?
+    private var playing: (name: String, player: ClipPlayer, start: CFTimeInterval)?
+    /// 现在演的是哪段；nil = 下次 render 重新挑
+    private var shown: String?
+    private var idleTurn = 0
     private var celebrating = false
+    private var visible = true
+    private var away = false   // 屏幕睡了或者切到了别的用户
     private var frameTimer: Timer?
-    private var blinkTimer: Timer?
-    private var shot = Shot.full
+    private var slotTimer: Timer?
     private var bubbleIsWaiting = false
 
     init(assets: Assets) {
-        clips = assets.clips.mapValues { ClipPlayer($0, fps: assets.fps) }
-        var c: [Shot: CGRect] = [:]
-        c[.side] = assets.closeups["focus"]
-        c[.look] = assets.closeups["glance"]
-        closeups = c
+        self.assets = assets
+        schedule = Schedule.load(assets)
+        scheduleStamp = Self.stamp()
+        idleTurn = Int.random(in: 0..<12)
         panel = PetPanel(size: Prefs.size)
         view = PetView(frame: NSRect(x: 0, y: 0, width: Prefs.size, height: Prefs.size))
         view.pet = self
         panel.contentView = view
         // 透明的地方要让鼠标穿过去：窗口默认不接鼠标，指针移到奶蛙身上才接
         NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in self?.updatePassThrough() }
-        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
-                                               object: nil, queue: .main) { [weak self] _ in self?.placeOnScreen() }
-    }
-
-    func show() {
-        Task { @MainActor in
-            await clips["focus"]?.loadStills()
-            await clips["glance"]?.loadStills()
-            placeOnScreen()
-            panel.orderFrontRegardless()
-            render()
-        }
-    }
-
-    func handle(_ msg: Link.Message, _ data: Data?) {
-        switch msg {
-        case .laugh: laugh()
-        case .quit: NSApp.terminate(nil)
-        case .play: celebrate(data.flatMap { String(data: $0, encoding: .utf8) } ?? "laugh", text: nil)
-        case .hook: hook(data)
-        }
-    }
-
-    func laugh() { celebrate("laugh", text: nil) }
-
-    private func hook(_ data: Data?) {
-        guard let data, let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if let f = sessions.handle(e), f.tier != .none {
-            celebrate(f.tier == .huge ? "roll" : "laugh", text: "\(f.project) 做完了 · \(Sessions.duration(f.seconds))")
-        }
-        render()
-    }
-
-    // MARK: 片段
-
-    /// 笑：先拉回全身，再播
-    private func celebrate(_ name: String, text: String?) {
-        guard let c = clips[name] else { return }
-        if celebrating {
-            // 正在拉回全身马上就笑；正在笑就不打断，快笑完了再来一次就从头笑
-            guard let p = playing, CACurrentMediaTime() - p.start >= p.player.duration * 0.8 else { return }
-        }
-        celebrating = true
-        stopMinorClip()
-        blinkTimer?.invalidate()
-        blinkTimer = nil
-        if let text {
-            bubbleIsWaiting = false
-            bubble.show(text, above: panel.frame, for: c.duration + 1.5)
-        }
-        frame(.full, animated: true) { [weak self] in
-            self?.play(name, important: true) {
-                self?.celebrating = false
-                self?.render()
+        let nc = NotificationCenter.default, ws = NSWorkspace.shared.notificationCenter
+        nc.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in self?.placeOnScreen() }
+        nc.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: panel, queue: .main) { [weak self] _ in self?.updateVisibility() }
+        for (n, away) in [(NSWorkspace.screensDidSleepNotification, true), (NSWorkspace.screensDidWakeNotification, false),
+                          (NSWorkspace.sessionDidResignActiveNotification, true), (NSWorkspace.sessionDidBecomeActiveNotification, false)] {
+            ws.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
+                self?.away = away
+                self?.updateVisibility()
             }
         }
     }
 
-    private func play(_ name: String, important: Bool, then: (() -> Void)? = nil) {
-        guard let c = clips[name] else { return }
+    func show() {
+        placeOnScreen()
+        panel.orderFrontRegardless()
+        scheduleSlotChange()
+        render()
+    }
+
+    func handle(_ msg: Link.Message, _ data: Data?) {
+        switch msg {
+        case .laugh, .play: laugh()
+        case .quit: NSApp.terminate(nil)
+        case .hook: hook(data)
+        }
+    }
+
+    func laugh() { celebrate(text: nil) }
+
+    private func hook(_ data: Data?) {
+        guard let data, let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let f = sessions.handle(e), f.tier != .none {
+            celebrate(text: "\(f.project) 做完了 · \(Sessions.duration(f.seconds))")
+        }
+        render()
+    }
+
+    // MARK: 状态
+
+    private func celebrate(text: String?) {
+        guard clip(assets.laugh) != nil else { return }
+        if celebrating {
+            // 正在笑就不打断，快笑完了再来一次就从头笑
+            guard let p = playing, CACurrentMediaTime() - p.start >= p.player.duration * 0.8 else { return }
+        }
+        celebrating = true
+        if let text, let c = clip(assets.laugh) {
+            bubbleIsWaiting = false
+            bubble.show(text, above: panel.frame, for: c.duration + 1.5)
+        }
+        shown = assets.laugh
+        play(assets.laugh) { [weak self] in
+            guard let self else { return }
+            self.celebrating = false
+            self.shown = nil
+            self.render()
+        }
+    }
+
+    /// 按当前状态摆好奶蛙。正在笑就等笑完（笑完会再调一次）
+    private func render() {
+        reloadIfEdited()
+        if celebrating { return }
+        let mood = sessions.mood
+        if mood == .waiting, let t = sessions.waitingText, bubble.text != t || !bubbleIsWaiting {
+            bubbleIsWaiting = true
+            bubble.show(t, above: panel.frame)
+        } else if mood != .waiting, bubbleIsWaiting {
+            bubbleIsWaiting = false
+            bubble.hide()
+        }
+        var want = mood == .waiting ? assets.look : mood == .working ? schedule.work : idleClip()
+        if clip(want) == nil { want = idleClip() }
+        guard want != shown, visible || want == assets.look else { return }
+        shown = want
+        let loop = assets.clips[want]?.loop ?? false
+        play(want, loop: loop)   // 不循环的（等你）播完停在最后一帧：一直看着你
+    }
+
+    /// 这个时段该出来的那只。已经在演这个时段的某一只就不换；同一时段有几只，每回到空闲换下一只
+    private func idleClip() -> String {
+        let names = schedule.slot().pets
+        if let s = shown, names.contains(s) { return s }
+        idleTurn += 1
+        return names[idleTurn % names.count]
+    }
+
+    // MARK: 片段
+
+    private func clip(_ name: String) -> ClipPlayer? {
+        if let c = clips[name] { return c }
+        guard let c = assets.clips[name] else { return nil }
+        clips[name] = ClipPlayer(c, fps: assets.fps)
+        return clips[name]
+    }
+
+    private func play(_ name: String, loop: Bool = false, then: (() -> Void)? = nil) {
+        guard let c = clip(name) else { then?(); return }
         playing?.player.stop()
-        blinkTimer?.invalidate()
-        blinkTimer = nil
-        playing = (name, c, important, CACurrentMediaTime())
+        playing = (name, c, CACurrentMediaTime())
         if frameTimer == nil {
             let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
                 if let img = self?.playing?.player.nextFrame() { self?.view.show(img) }
@@ -110,80 +149,124 @@ final class Pet {
         }
         c.play { [weak self] in
             guard let self, self.playing?.player === c else { return }
-            self.playing = nil
-            self.frameTimer?.invalidate()
-            self.frameTimer = nil
-            if let then { then() } else { self.render() }
+            if loop { return self.play(name, loop: true) }
+            self.stopPlaying()
+            then?()
         }
     }
 
-    /// 停掉眨眼这种可以随时打断的小片段
-    private func stopMinorClip() {
-        guard let p = playing, !p.important else { return }
-        p.player.stop()
+    private func stopPlaying() {
+        playing?.player.stop()
         playing = nil
         frameTimer?.invalidate()
         frameTimer = nil
     }
 
-    /// 按当前状态摆好奶蛙。正在笑就等笑完（笑完会再调一次）
-    private func render() {
-        if celebrating { return }
-        let mood = sessions.mood
-        if mood == .waiting {
-            if let t = sessions.waitingText, bubble.text != t || !bubbleIsWaiting {
-                bubbleIsWaiting = true
-                bubble.show(t, above: panel.frame)
-            }
-            blinkTimer?.invalidate()
-            blinkTimer = nil
-            stopMinorClip()
-            // 和原片一样一刀切：侧脸特写 → 转过来直勾勾看着你
-            view.show(clips["glance"]?.last)
-            frame(.look, animated: false)
-            return
+    /// 被别的窗口挡住、屏幕睡了、切走用户：停掉循环；回来再接着演
+    private func updateVisibility() {
+        let now = panel.occlusionState.contains(.visible) && !away
+        guard now != visible else { return }
+        visible = now
+        if !visible, !celebrating, let s = shown, assets.clips[s]?.loop == true {
+            stopPlaying()
+            shown = nil
         }
-        if bubbleIsWaiting {
-            bubbleIsWaiting = false
-            bubble.hide()
-        }
-        if mood == .working {
-            if shot != .side {
-                stopMinorClip()
-                view.show(clips["focus"]?.first)
-                frame(.side, animated: shot == .full)   // 从全身慢慢推近；从转头特写一刀切回侧脸
-            }
-            scheduleBlink()
-        } else {
-            blinkTimer?.invalidate()
-            blinkTimer = nil
-            stopMinorClip()
-            view.show(clips["focus"]?.first)
-            if shot != .full { frame(.full, animated: true) }
-        }
+        if visible { render() }
     }
 
-    /// 干活的时候隔几秒眨一下眼（片段在当前取景里播，还是侧脸特写）
-    private func scheduleBlink() {
-        guard blinkTimer == nil else { return }
-        blinkTimer = Timer.scheduledTimer(withTimeInterval: .random(in: 3...7), repeats: false) { [weak self] _ in
+    /// 到点换下一个时段的奶蛙（正在干活、等你、笑的时候不动，回到空闲时自然换）
+    private func scheduleSlotChange() {
+        slotTimer?.invalidate()
+        guard let at = schedule.nextChange() else { return }
+        let t = Timer(fire: at.addingTimeInterval(1), interval: 0, repeats: false) { [weak self] _ in
             guard let self else { return }
-            self.blinkTimer = nil
-            if self.playing == nil, !self.celebrating, self.sessions.mood == .working {
-                self.play("focus", important: false)
-            } else {
-                self.render()
-            }
+            self.render()
+            self.scheduleSlotChange()
         }
+        RunLoop.main.add(t, forMode: .common)
+        slotTimer = t
     }
 
-    // MARK: 取景（惊鸿一瞥）
+    // MARK: 安排（哪个时段出来哪几只、干活时是哪只）
 
-    private func frame(_ shot: Shot, animated: Bool, then: (() -> Void)? = nil) {
-        let changed = self.shot != shot
-        self.shot = shot
-        let rect = closeups[shot] ?? CGRect(x: 0, y: 0, width: 1, height: 1)
-        view.setCrop(rect, duration: animated && changed ? (shot == .full ? 0.3 : 0.8) : 0, then: then)
+    private static func stamp() -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: Schedule.file.path))?[.modificationDate] as? Date
+    }
+
+    private func reloadIfEdited() {
+        let now = Self.stamp()
+        guard now != scheduleStamp else { return }
+        scheduleStamp = now
+        use(Schedule.load(assets))
+    }
+
+    /// 换一套安排：正在演的空闲 / 干活那只要是被换掉了，回到当时该有的那只
+    private func use(_ s: Schedule) {
+        guard s != schedule else { return }
+        schedule = s
+        if let cur = shown, cur != assets.look, cur != assets.laugh, !celebrating {
+            stopPlaying()
+            shown = nil
+        }
+        scheduleSlotChange()
+        render()
+    }
+
+    private func change(_ edit: (inout Schedule) -> Void) {
+        var s = schedule
+        edit(&s)
+        try? s.save()
+        scheduleStamp = Self.stamp()
+        use(s)
+    }
+
+    private func scheduleMenu() -> [NSMenuItem] {
+        let idle = NSMenu()
+        let now = schedule.slot()
+        for (i, slot) in schedule.idle.enumerated() {
+            let to = schedule.idle[(i + 1) % schedule.idle.count].from
+            let pets = NSMenu()
+            for p in assets.loopPets {
+                let it = item("\(assets.title(p))　\(assets.clips[p]?.desc ?? "")") { [weak self] in
+                    self?.change { $0.toggle(p, inSlotFrom: slot.from) }
+                }
+                it.state = slot.pets.contains(p) ? .on : .off
+                pets.addItem(it)
+            }
+            let names = slot.pets.map(assets.title).joined(separator: "、")
+            let it = NSMenuItem(title: String(format: "%02d:00–%02d:00　%@%@", slot.from, to, names, slot == now ? "　← 现在" : ""),
+                                action: nil, keyEquivalent: "")
+            it.submenu = pets
+            idle.addItem(it)
+        }
+        idle.addItem(.separator())
+        idle.addItem(NSMenuItem(title: "同一时段勾了几只，每回到空闲轮流出来一只", action: nil, keyEquivalent: ""))
+        idle.addItem(item("改时段的起止时间…（打开配置文件）") { [weak self] in self?.openConfig() })
+        idle.addItem(item("恢复默认") { [weak self] in
+            try? FileManager.default.removeItem(at: Schedule.file)
+            self?.reloadIfEdited()
+        })
+        let idleItem = NSMenuItem(title: "空闲时", action: nil, keyEquivalent: "")
+        idleItem.submenu = idle
+
+        let work = NSMenu()
+        for p in assets.loopPets {
+            let it = item("\(assets.title(p))　\(assets.clips[p]?.desc ?? "")") { [weak self] in self?.change { $0.work = p } }
+            it.state = schedule.work == p ? .on : .off
+            work.addItem(it)
+        }
+        let workItem = NSMenuItem(title: "干活时：\(assets.title(schedule.work))", action: nil, keyEquivalent: "")
+        workItem.submenu = work
+        return [idleItem, workItem]
+    }
+
+    /// 打开 config.json 改时段；还没有就先把现在的安排写出去
+    private func openConfig() {
+        if !FileManager.default.fileExists(atPath: Schedule.file.path) {
+            try? schedule.save()
+            scheduleStamp = Self.stamp()
+        }
+        NSWorkspace.shared.open(Schedule.file)
     }
 
     // MARK: 位置和鼠标
@@ -224,9 +307,8 @@ final class Pet {
     func menu() -> NSMenu {
         let m = NSMenu()
         m.addItem(item("笑一下") { [weak self] in self?.laugh() })
-        m.addItem(item("笑到打滚") { [weak self] in self?.celebrate("roll", text: nil) })
         let sizes = NSMenu()
-        for (name, s) in [("小", 72.0), ("中", 110.0), ("大", 160.0), ("特大", 220.0)] {
+        for (name, s) in [("小", 110.0), ("中", 150.0), ("大", 200.0), ("特大", 260.0)] {
             let it = item(name) { [weak self] in self?.resize(to: s) }
             it.state = abs(Prefs.size - s) < 1 ? .on : .off
             sizes.addItem(it)
@@ -234,6 +316,12 @@ final class Pet {
         let size = NSMenuItem(title: "大小", action: nil, keyEquivalent: "")
         size.submenu = sizes
         m.addItem(size)
+        m.addItem(.separator())
+        scheduleMenu().forEach(m.addItem)
+        m.addItem(.separator())
+        if !assets.credit.text.isEmpty {
+            m.addItem(item(assets.credit.text) { [url = assets.credit.url] in if let url { NSWorkspace.shared.open(url) } })
+        }
         m.addItem(.separator())
         m.addItem(item("让它走（naiwa 叫回来）") {
             Prefs.dismissed = true
@@ -296,28 +384,6 @@ final class PetView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         image = img
-        CATransaction.commit()
-    }
-
-    /// 只显示画面里的这一块（0–1 的比例，原点在左上），duration > 0 时像镜头推拉一样过去
-    func setCrop(_ r: CGRect, duration: Double, then: (() -> Void)? = nil) {
-        guard let layer else { then?(); return }
-        // contentsRect 的原点在图片左下角
-        let target = CGRect(x: r.minX, y: 1 - r.maxY, width: r.width, height: r.height)
-        CATransaction.begin()
-        CATransaction.setCompletionBlock { then?() }
-        if duration > 0 {
-            let a = CABasicAnimation(keyPath: "contentsRect")
-            a.fromValue = NSValue(rect: (layer.presentation() ?? layer).contentsRect)
-            a.toValue = NSValue(rect: target)
-            a.duration = duration
-            a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            layer.add(a, forKey: "crop")
-        } else {
-            CATransaction.setDisableActions(true)
-            layer.removeAnimation(forKey: "crop")
-        }
-        layer.contentsRect = target
         CATransaction.commit()
     }
 
@@ -414,3 +480,4 @@ struct Stroke {
         return false
     }
 }
+

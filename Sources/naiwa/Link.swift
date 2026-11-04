@@ -7,7 +7,7 @@ enum Link {
         case laugh = 1
         case quit = 2
         case hook = 3   // 数据：Claude Code hook 的输入 JSON
-        case play = 4   // 数据：片段名（laugh / roll）
+        case play = 4   // 兼容旧版的 naiwa play：现在都是笑一下
     }
 
     static let portName = "com.nwverse.naiwa" as CFString
@@ -51,7 +51,7 @@ enum CLI {
         exit(Link.send(.play, data: Data(clip.utf8)) ? 0 : 1)
     }
 
-    /// 演示一遍所有状态：干活（惊鸿一瞥）→ 等你批准 → 批准后接着干 → 干完捧腹大笑 → 超长任务笑到打滚
+    /// 演示一遍所有状态：空闲 → 干活（沉溺）→ 等你批准 → 批准后接着干 → 干完捧腹大笑
     static func demo() {
         if !Link.send(.hook, data: Data("{}".utf8)) {
             launch(["run"])
@@ -64,15 +64,39 @@ enum CLI {
             _ = Link.send(.hook, data: try! JSONSerialization.data(withJSONObject: e))
             usleep(useconds_t(wait * 1_000_000))
         }
-        event("UserPromptSubmit", wait: 0.3, "Claude 开始干活：推近成侧脸特写（惊鸿一瞥），隔几秒眨眼")
-        event("PreToolUse", wait: 5)
-        event("Notification", ["message": "Claude needs your permission to use Bash"], wait: 4, "等你批准：转过来直勾勾看着你")
-        event("PreToolUse", wait: 2.5, "批准了：回到侧脸特写接着干")
-        event("Stop", ["naiwa_seconds": 125.0], wait: 6.5, "干完一个活（假装跑了 2 分钟）：捧腹大笑")
-        event("UserPromptSubmit", wait: 0.3, "超长任务（假装跑了 15 分钟）：笑到倒地打滚")
-        event("PreToolUse", wait: 0.5)
-        event("Stop", ["naiwa_seconds": 900.0], wait: 0)
+        print("空闲：这个时段的奶蛙在慢慢地动")
+        usleep(3_000_000)
+        event("UserPromptSubmit", wait: 0.3, "Claude 开始干活：沉溺奶蛙，闭着眼悬浮在水里")
+        event("PreToolUse", wait: 6)
+        event("Notification", ["message": "Claude needs your permission to use Bash", "notification_type": "permission_prompt"], wait: 6,
+              "等你批准：睁开眼转过来看着你")
+        event("PreToolUse", wait: 3, "批准了：接着沉进去干")
+        event("Stop", ["naiwa_seconds": 125.0], wait: 6, "干完一个活（假装跑了 2 分钟）：捧腹大笑，笑完回到空闲")
         event("SessionEnd", wait: 0)
+    }
+
+    /// 列出有哪几只、现在怎么安排的
+    static func pets() {
+        guard let assets = Assets.load() else {
+            FileHandle.standardError.write(Data("naiwa: 找不到素材目录\n".utf8))
+            exit(1)
+        }
+        let s = Schedule.load(assets)
+        let mine = FileManager.default.fileExists(atPath: Schedule.file.path)
+        print("有这几只奶蛙（\(assets.credit.text)）：")
+        let width = (assets.pets.map(\.count).max() ?? 8) + 2
+        for p in assets.pets {
+            guard let c = assets.clips[p] else { continue }
+            let use = c.loop ? "空闲、干活都能用" : p == assets.look ? "等你批准时" : p == assets.laugh ? "干完一个活时" : ""
+            print("  " + p.padding(toLength: width, withPad: " ", startingAt: 0) + c.title + "：" + c.desc + "（" + use + "）")
+        }
+        print("\n现在的安排（" + (mine ? Schedule.file.path.replacingOccurrences(of: NSHomeDirectory(), with: "~") : "默认") + "）：")
+        for (i, slot) in s.idle.enumerated() {
+            let to = s.idle[(i + 1) % s.idle.count].from
+            print(String(format: "  空闲 %02d:00–%02d:00  ", slot.from, to) + slot.pets.map(assets.title).joined(separator: "、"))
+        }
+        print("  干活时         " + assets.title(s.work))
+        print("\n改法：右键奶蛙 →「空闲时」「干活时」里勾；或者改 ~/.config/naiwa/config.json（时段起点也能改，改完自动生效）。")
     }
 
     /// Claude Code 的 hook：把 stdin 里的事件 JSON 原样转给奶蛙，由它记账、决定反应。
@@ -136,10 +160,10 @@ enum Prefs {
     }
     /// 一轮跑满这么多秒、并且动过工具，才算干完一个活（捧腹大笑）
     static var bigSeconds: Double { d.object(forKey: "bigSeconds") as? Double ?? 60 }
-    /// 跑满这么多秒算超长任务（笑到倒地打滚）
+    /// 跑满这么多秒算超长任务（现在笑法一样，只在气泡里报时长）
     static var hugeSeconds: Double { d.object(forKey: "hugeSeconds") as? Double ?? 600 }
     static var size: CGFloat {
-        get { d.object(forKey: "size") as? CGFloat ?? 110 }
+        get { d.object(forKey: "size") as? CGFloat ?? 150 }
         set { d.set(newValue, forKey: "size") }
     }
     static var origin: NSPoint? {

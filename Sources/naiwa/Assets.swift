@@ -1,20 +1,36 @@
 import AppKit
 import AVFoundation
 
-/// 素材目录（scripts/make_assets.py 生成）：
-///   assets.json  {"fps": 30, "clips": {"laugh": {"video": "laugh.mov", "frames": 122}, …},
-///                 "closeup": {"focus": {"x":…, "y":…, "w":…, "h":…}, "glance": …}}
-///   *.mov        带透明通道的 HEVC：focus 站姿和眨眼 / glance 转头看你 / laugh 捧腹大笑 / roll 笑到打滚
-///   closeup      侧脸特写、转头特写的取景框（0–1 的比例，原点在左上）
+/// 素材目录（scripts/make_art.py 生成）：
+///   assets.json  {"fps": 24, "credit": {"text": "画：防御老猫（B 站）", "url": "…"},
+///                 "pets": ["sleep", "listen", …],
+///                 "clips": {"listen": {"video": "listen.mov", "frames": 96, "loop": true, "title": "听歌", "desc": "…"}, …},
+///                 "idle": [{"from": 12, "pets": ["listen", "relax"]}, …],
+///                 "work": "immerse", "look": "look", "laugh": "laugh"}
+///   *.mov        带透明通道的 HEVC，画面是防御老猫画的奶蛙，逐帧抠出来的
+///   pets         有哪几只（菜单里的顺序）；循环的那些空闲、干活都能用
+///   idle / work  默认的安排，用户可以在 ~/.config/naiwa/config.json 里换（见 Schedule）
+///   look / laugh 等你（播完停在最后一帧）/ 做完
 struct Assets {
     struct Clip {
         let video: URL
         let frames: Int
+        let loop: Bool
+        let title: String
+        let desc: String
     }
 
     let fps: Double
     let clips: [String: Clip]
-    let closeups: [String: CGRect]
+    let pets: [String]
+    let defaults: Schedule
+    let look: String, laugh: String
+    let credit: (text: String, url: URL?)
+
+    /// 能拿来空闲、干活的（循环的）那几只
+    var loopPets: [String] { pets.filter { clips[$0]?.loop == true } }
+
+    func title(_ name: String) -> String { clips[name]?.title ?? name }
 
     static func load() -> Assets? {
         for dir in candidates() {
@@ -24,18 +40,21 @@ struct Assets {
             var clips: [String: Clip] = [:]
             for (name, c) in list {
                 guard let video = c["video"] as? String else { continue }
-                clips[name] = Clip(video: dir.appendingPathComponent(video), frames: c["frames"] as? Int ?? 0)
+                clips[name] = Clip(video: dir.appendingPathComponent(video), frames: c["frames"] as? Int ?? 0, loop: c["loop"] as? Bool ?? false,
+                                   title: c["title"] as? String ?? name, desc: c["desc"] as? String ?? "")
             }
-            var closeups: [String: CGRect] = [:]
-            for (name, r) in j["closeup"] as? [String: [String: Double]] ?? [:] {
-                closeups[name] = CGRect(x: r["x"] ?? 0, y: r["y"] ?? 0, width: r["w"] ?? 1, height: r["h"] ?? 1)
-            }
-            if clips["laugh"] != nil { return Assets(fps: j["fps"] as? Double ?? 30, clips: clips, closeups: closeups) }
+            let pets = (j["pets"] as? [String] ?? clips.keys.sorted()).filter { clips[$0] != nil }
+            let defaults = Schedule(json: j, known: Set(clips.keys))
+            let look = j["look"] as? String ?? "", laugh = j["laugh"] as? String ?? ""
+            guard let defaults, clips[laugh] != nil else { continue }
+            let c = j["credit"] as? [String: String] ?? [:]
+            return Assets(fps: j["fps"] as? Double ?? 24, clips: clips, pets: pets, defaults: defaults, look: look, laugh: laugh,
+                          credit: (c["text"] ?? "", c["url"].flatMap(URL.init(string:))))
         }
         return nil
     }
 
-    /// NAIWA_ASSETS → Naiwa.app/Contents/Resources/assets → 从可执行文件往上找仓库里的 assets/
+    /// NAIWA_ASSETS → Naiwa.app/Contents/Resources/assets → 可执行文件旁边的 ../Resources/assets → 往上找仓库里的 assets/
     private static func candidates() -> [URL] {
         var out: [URL] = []
         if let env = ProcessInfo.processInfo.environment["NAIWA_ASSETS"] {
@@ -45,6 +64,8 @@ struct Assets {
             out.append(res.appendingPathComponent("assets"))
         }
         var dir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+        // 经过 ~/.local/bin/naiwa 软链跑的时候 Bundle.main 认不出 App，按可执行文件的位置找 Contents/Resources/assets
+        out.append(dir.deletingLastPathComponent().appendingPathComponent("Resources/assets"))
         for _ in 0..<5 {
             out.append(dir.appendingPathComponent("assets"))
             dir.deleteLastPathComponent()
@@ -61,7 +82,7 @@ final class ClipPlayer {
     private let player: AVPlayer
     private let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
     private var onEnd: (() -> Void)?
-    /// 第一帧和最后一帧（站姿、转头看你那一眼），和播放走同一条解码路径，切过去颜色不会跳
+    /// 第一帧和最后一帧，和播放走同一条解码路径，切过去颜色不会跳
     private(set) var first: CGImage?
     private(set) var last: CGImage?
 

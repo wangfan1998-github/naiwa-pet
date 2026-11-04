@@ -1,5 +1,5 @@
 #!/bin/bash
-# 卸载：撤掉 Claude Code 接入、关掉奶蛙，删掉 App、命令行链接、登录自启和偏好设置
+# 卸载：撤掉 Claude Code 接入、关掉奶蛙，删掉 App、命令行链接、登录自启、偏好设置和自己挑的安排
 set -uo pipefail
 
 DEST=~/Applications/Naiwa.app
@@ -18,4 +18,7 @@ if [ -L "$BIN" ] && [ "$(readlink "$BIN")" = "$DEST/Contents/MacOS/naiwa" ]; the
 fi
 rm -rf "$DEST"
 defaults delete com.nwverse.naiwa 2>/dev/null
+# 自己挑的安排（右键「空闲时」「干活时」）；目录里还有别的东西就留着目录
+rm -f ~/.config/naiwa/config.json
+rmdir ~/.config/naiwa 2>/dev/null
 echo "已卸载奶蛙"
