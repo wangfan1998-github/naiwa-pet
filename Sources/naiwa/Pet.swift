@@ -1,12 +1,13 @@
 import AppKit
 
-/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗。画面是防御老猫画的奶蛙（Seedance 让它动起来、逐帧抠出来），没有声音：
-///   空闲：按一天的时段换一只，在那里慢慢地动（安睡、听歌、悠闲、云幻、封闭、孤独），首尾接上一直循环
+/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗。画面是防御老猫画的奶蛙，没有声音：
+///   空闲：按一天的时段换一只，在那里慢慢地动（安睡、听歌、悠闲、云幻、封闭、孤独），首尾接上一直循环；
+///         鼠标在它身上停一下就换下一只（到下个时段恢复）
 ///   干活：沉溺奶蛙，闭着眼悬浮在水里，沉浸在活里
 ///   等你：沉溺奶蛙睁开眼转过来看着你，停住，头顶冒「项目 等你批准 Bash」
 ///   做完：惊鸿一瞥：镜头推近，它斜着瞥你一眼，头顶冒「项目 做完了 · 时长」；摸它、点它也会瞥你
 /// 优先级：瞥 > 等你 > 干活 > 空闲。瞥的时候不会被打断，瞥完再回到当时该有的状态。状态之间硬切（透明的画面叠化会出重影）。
-/// 窗口被挡住、屏幕睡了就停播，不白占 CPU。
+/// 窗口被挡住、屏幕睡了、锁屏就停播，不白占 CPU。
 final class Pet {
     static var shared: Pet?
 
@@ -24,10 +25,14 @@ final class Pet {
     private var idleTurn = 0
     private var reacting = false
     private var visible = true
-    private var away = false   // 屏幕睡了或者切到了别的用户
+    private var away = Pet.screenLocked()   // 屏幕睡了、锁屏了，或者切到了别的用户
     private var frameTimer: Timer?
     private var slotTimer: Timer?
     private var bubbleIsWaiting = false
+    /// 鼠标停在它身上换出来的那只，到下个时段（或者换了安排）就不算了
+    private var picked: String?
+    private var hovering = false
+    private var hoverTimer: Timer?
 
     init(assets: Assets) {
         self.assets = assets
@@ -50,11 +55,19 @@ final class Pet {
                 self?.updateVisibility()
             }
         }
+        // 锁屏时窗口的遮挡状态还是「看得见」，要单独听锁屏 / 解锁
+        for (n, away) in [("com.apple.screenIsLocked", true), ("com.apple.screenIsUnlocked", false)] {
+            DistributedNotificationCenter.default().addObserver(forName: .init(n), object: nil, queue: .main) { [weak self] _ in
+                self?.away = away
+                self?.updateVisibility()
+            }
+        }
     }
 
     func show() {
         placeOnScreen()
         panel.orderFrontRegardless()
+        visible = !away   // 锁着屏启动就先别播，解锁的通知来了再播
         scheduleSlotChange()
         render()
     }
@@ -67,7 +80,10 @@ final class Pet {
         }
     }
 
-    func glance() { react(text: nil) }
+    func glance() {
+        hoverTimer?.invalidate()   // 点它、摸它不算「停一下」
+        react(text: nil)
+    }
 
     private func hook(_ data: Data?) {
         guard let data, let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -119,8 +135,9 @@ final class Pet {
         play(want, loop: loop)   // 不循环的（等你）播完停在最后一帧：一直看着你
     }
 
-    /// 这个时段该出来的那只。已经在演这个时段的某一只就不换；同一时段有几只，每回到空闲换下一只
+    /// 这个时段该出来的那只。鼠标换过就是换出来的那只；已经在演这个时段的某一只就不换；同一时段有几只，每回到空闲换下一只
     private func idleClip() -> String {
+        if let p = picked, assets.clips[p] != nil { return p }
         let names = schedule.slot().pets
         if let s = shown, names.contains(s) { return s }
         idleTurn += 1
@@ -140,6 +157,9 @@ final class Pet {
         guard let c = clip(name) else { then?(); return }
         playing?.player.stop()
         playing = (name, c, CACurrentMediaTime())
+        // 播放器只留现在这只和干活 / 等你 / 做完要用的，别的放掉（每个都占着解码器和缓冲）
+        let keep: Set = [name, schedule.work, assets.look, assets.done]
+        clips = clips.filter { keep.contains($0.key) }
         if frameTimer == nil {
             let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
                 if let img = self?.playing?.player.nextFrame() { self?.view.show(img) }
@@ -162,7 +182,11 @@ final class Pet {
         frameTimer = nil
     }
 
-    /// 被别的窗口挡住、屏幕睡了、切走用户：停掉循环；回来再接着演
+    private static func screenLocked() -> Bool {
+        (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
+    }
+
+    /// 被别的窗口挡住、屏幕睡了、锁屏、切走用户：停掉循环；回来再接着演
     private func updateVisibility() {
         let now = panel.occlusionState.contains(.visible) && !away
         guard now != visible else { return }
@@ -180,6 +204,7 @@ final class Pet {
         guard let at = schedule.nextChange() else { return }
         let t = Timer(fire: at.addingTimeInterval(1), interval: 0, repeats: false) { [weak self] _ in
             guard let self else { return }
+            self.picked = nil
             self.render()
             self.scheduleSlotChange()
         }
@@ -204,6 +229,7 @@ final class Pet {
     private func use(_ s: Schedule) {
         guard s != schedule else { return }
         schedule = s
+        picked = nil
         if let cur = shown, cur != assets.look, cur != assets.done, !reacting {
             stopPlaying()
             shown = nil
@@ -241,6 +267,7 @@ final class Pet {
         }
         idle.addItem(.separator())
         idle.addItem(NSMenuItem(title: "同一时段勾了几只，每回到空闲轮流出来一只", action: nil, keyEquivalent: ""))
+        idle.addItem(NSMenuItem(title: "鼠标在奶蛙身上停一下就换下一只，到下个时段恢复", action: nil, keyEquivalent: ""))
         idle.addItem(item("改时段的起止时间…（打开配置文件）") { [weak self] in self?.openConfig() })
         idle.addItem(item("恢复默认") { [weak self] in
             try? FileManager.default.removeItem(at: Schedule.file)
@@ -276,6 +303,28 @@ final class Pet {
         let m = NSEvent.mouseLocation
         let over = panel.frame.contains(m) && view.isOpaque(atScreen: m)
         if panel.ignoresMouseEvents == over { panel.ignoresMouseEvents = !over }
+        // 停一下：指针进到奶蛙身上开始计时；离开整个窗口才能再来一次（换了一只以后形状变了，指针可能落在透明处，不算离开）
+        if over, !hovering {
+            hovering = true
+            hoverTimer?.invalidate()
+            hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: false) { [weak self] _ in self?.pickNext() }
+        } else if hovering, !panel.frame.contains(m) {
+            hovering = false
+            hoverTimer?.invalidate()
+        }
+    }
+
+    /// 空闲时换下一只（所有能循环的轮着来），头顶报一下名字
+    private func pickNext() {
+        guard !reacting, !view.dragging, sessions.mood == .idle, let cur = shown else { return }
+        let all = assets.loopPets
+        guard let i = all.firstIndex(of: cur) ?? all.indices.first else { return }
+        let next = all[(i + 1) % all.count]
+        picked = next
+        stopPlaying()
+        shown = nil
+        render()
+        bubble.show(assets.title(next), above: panel.frame, for: 1.5)
     }
 
     func placeOnScreen() {
@@ -364,7 +413,8 @@ final class PetPanel: NSPanel {
 
 final class PetView: NSView {
     weak var pet: Pet?
-    var image: CGImage? { didSet { layer?.contents = image } }
+    /// 正在显示的那一帧：留着它，解码器就不会把这块 IOSurface 拿去复用
+    private(set) var current: CVPixelBuffer?
     private(set) var dragging = false
     private var downAt: NSPoint = .zero
     private var downOrigin: NSPoint = .zero
@@ -380,30 +430,32 @@ final class PetView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(_ img: CGImage?) {
+    func show(_ pb: CVPixelBuffer) {
+        guard let surface = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue() else { return }
+        // IOSurface 自己不带色彩空间：标成 sRGB，和编码时一致（不标的话按设备色彩解释，颜色会偏）
+        if IOSurfaceCopyValue(surface, kIOSurfaceColorSpace) == nil, let srgb = CGColorSpace(name: CGColorSpace.sRGB)?.copyPropertyList() {
+            IOSurfaceSetValue(surface, kIOSurfaceColorSpace, srgb)
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        image = img
+        layer?.contents = surface
         CATransaction.commit()
+        current = pb
     }
 
-    /// 屏幕坐标这一点上奶蛙是不是实心的（透明处让鼠标穿过去）
+    /// 屏幕坐标这一点上奶蛙是不是实心的（透明处让鼠标穿过去）：直接读当前帧那个像素的透明度
     func isOpaque(atScreen p: NSPoint) -> Bool {
-        guard let win = window, let img = image, let crop = layer?.contentsRect else { return false }
+        guard let win = window, let pb = current else { return false }
         let local = convert(win.convertPoint(fromScreen: p), from: nil)
-        let u = crop.minX + local.x / bounds.width * crop.width
-        let v = crop.minY + local.y / bounds.height * crop.height   // 从下往上
-        let x = Int(u * CGFloat(img.width)), y = Int((1 - v) * CGFloat(img.height))
-        guard (0..<img.width).contains(x), (0..<img.height).contains(y) else { return false }
-        var px = [UInt8](repeating: 0, count: 4)
-        let hit = px.withUnsafeMutableBytes { buf -> Bool in
-            guard let ctx = CGContext(data: buf.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
-                                      space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
-            ctx.draw(img, in: CGRect(x: -x, y: -(img.height - 1 - y), width: img.width, height: img.height))
-            return true
-        }
-        return hit && px[3] > 60
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        // 画面是方的、按比例撑满视图（resizeAspect）；y 从下往上
+        let x = Int(local.x / bounds.width * CGFloat(w)), y = Int((1 - local.y / bounds.height) * CGFloat(h))
+        guard (0..<w).contains(x), (0..<h).contains(y) else { return false }
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return false }
+        let alpha = base.load(fromByteOffset: y * CVPixelBufferGetBytesPerRow(pb) + x * 4 + 3, as: UInt8.self)   // BGRA
+        return alpha > 60
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -480,4 +532,5 @@ struct Stroke {
         return false
     }
 }
+
 

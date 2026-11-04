@@ -4,7 +4,7 @@ naiwa-pet：macOS 桌面上的奶蛙（画：防御老猫）。空闲时按一�
 
 ## 约定
 
-- `[必须]` 保持小：不引入第三方依赖，只用系统框架（AppKit、AVFoundation）。只有在播片段时才开取帧定时器；空闲和干活的循环只在窗口看得见时播，被挡住、屏幕睡了、切走用户要停（`Pet.updateVisibility`）。
+- `[必须]` 保持小：不引入第三方依赖，只用系统框架（AppKit、AVFoundation）。只有在播片段时才开取帧定时器；空闲和干活的循环只在窗口看得见时播，被挡住、锁屏、屏幕睡了、切走用户要停（`Pet.updateVisibility`）。锁屏时窗口遮挡状态仍是「看得见」，要听 `com.apple.screenIsLocked` / `screenIsUnlocked`，启动时也要先查一次。改播放相关代码后用 `top -pid` 量 CPU：现在播放约 3–4%（release），锁屏 0%。
 - `[必须]` `naiwa hook` 必须快（现在约 5 毫秒）、不输出任何东西、永远返回 0。理由：Claude 每调一次工具都会先跑它。
 - `[禁止]` 用模型判断「做完没有」：按时长和有没有调工具在本地算，不花 token。
 - `[必须]` 透明的地方让鼠标穿过去，点奶蛙不抢焦点（`nonactivatingPanel` + 按当前帧的像素切换 `ignoresMouseEvents`）。改窗口或鼠标逻辑后，要在真机上确认点它背后的窗口还能点到。
@@ -14,6 +14,7 @@ naiwa-pet：macOS 桌面上的奶蛙（画：防御老猫）。空闲时按一�
 - `[禁止]` 加声音：用户嫌吵。
 - `[禁止]` README 里写参考了哪个项目、用了哪些工具和服务、素材是怎么做出来的：用户不想让别人知道思路。只保留画师署名（作者同意使用的条件）。这些细节写在本文件和 `scripts/make_art.py` 里。
 - README 里的动图是 `docs/pets/*.webp` 和 `docs/demo.webp`：带透明通道的动态 WebP（240px，GitHub 浅色、深色主题都干净；GIF 只有 1 位透明，边缘有锯齿）。加了新奶蛙要补一张。
+- 悬停换只：空闲时指针停在奶蛙不透明处 0.7 秒换下一只（`Pet.pickNext`），离开整个窗口才能再来一次（换了形状以后指针可能落在透明处，不能算离开）；换出来的只管到下个时段。播放器只留当前这只和干活 / 等你 / 做完要用的。
 - `[必须]` 哪个时段出来哪几只、干活时是哪只要能让用户自己换：默认安排写在 `art/pets.json`（打进 assets.json），用户的在 `~/.config/naiwa/config.json`（右键菜单读写、手改自动生效）。理由：用户说现在这套只是他自己的想法，别人可能喜欢别的。新加的奶蛙进 `art/pets.json` 的 clips 就会出现在菜单里，不要在代码里写死名字。
 - 画面不是原创也不是 CC0：画的作者是防御老猫（同意免费开源使用、要署名），奶蛙形象本身另有权利人，见 README「版权」。不要商用。
 
@@ -23,8 +24,8 @@ naiwa-pet：macOS 桌面上的奶蛙（画：防御老猫）。空闲时按一�
 - B 站：没有访客 cookie（buvid3/buvid4）的请求回 412。拿防御老猫的原画用 opus 接口（`x/polymer/web-dynamic/v1/opus/feed/space` 列动态、`opus/detail?id=` 拿全部图，原图 1536×2752 / 5504×3072）；旧的 `web-dynamic/v1/feed/space` 签了 WBI 也是 412。图片 URL 后面加 `@240w.jpg` 是缩略图，别用 `_1e_1c` 那种裁剪参数。
 - 抠图用 rembg `isnet-general-use`（`birefnet` 效果差不多但慢 7 倍），不要按颜色抠：奶白肚皮在轮廓边上，会被一起吃掉。rembg 会把反光的肚皮当成半透明（深色桌面上发灰），也会留下栏杆、阴影的零碎小块：`make_art.py` 里补实身体、去掉不连着的小块；身边本来就有分开的东西（封闭奶蛙那圈小鱼）的片段要设 `islands`。rembg 逐帧不稳：晾衣奶蛙蓝天前面的白肚皮隔几十帧就漏一段，3 帧平均补不回来；背景是纯色的片段设 `key` 按背景色补。新片段处理完要逐帧看（或者算每帧透明面积的波动），别只看一帧。
 - 带透明通道的 HEVC 按预乘 alpha 解释，PNG 是非预乘的：编码前必须预乘（`make_art.py` 在预乘空间里处理、直接把预乘值交给编码器），否则边缘发白。
-- 不要用 `AVPlayerLayer` 直接显示：它的画面由系统单独合成，截窗口抓不到，没法验证。现在用 `AVPlayerItemVideoOutput` 取帧贴到普通图层上。
-- 看不到屏幕时（沙箱、锁屏）验证画面：把 `view.layer`（推拉过程中用 `presentation()`）用 `render(in:)` 画进离屏位图再存 PNG；截窗口在锁屏时是全透明的。
+- 显示：`AVPlayerItemVideoOutput` 取 IOSurface 做底的 BGRA 帧，直接设成图层的 `contents`（`PetView.show`），并给 IOSurface 标上 sRGB。原来复制成 CGImage 再贴，空闲循环多占 6–8% CPU。命中测试直接读这一帧的像素缓冲。不要用 `AVPlayerLayer`：画面由系统单独合成，没法验证。
+- 看不到屏幕时（沙箱、锁屏）验证画面：截窗口（`CGWindowListCreateImage`）在锁屏或没有录屏权限时全是透明的；`layer.render(in:)` 不画 IOSurface 内容。用 `CARenderer(mtlTexture:)` 把一个以当前 IOSurface 为内容的图层离屏合成到 Metal 纹理再读回（先 `CATransaction.flush()`；读回来是上下颠倒的，放个标记块判断方向）。
 - 在 Naiwa.app 里拿自己的 bundle id 当 `UserDefaults(suiteName:)` 会返回 nil。
 - CFMessagePort 回调给的 CFData 只在回调期间有效：必须当场复制再丢到主线程，直接桥接成 `Data` 会读到垃圾。
 - 「等你」只看 `Notification` 的 `notification_type`（`permission_prompt` 等），不要按提示语猜：`idle_prompt` 和别的提醒文案不止一种，按文字过滤漏过一次，奶蛙在没人要权限时显示了「等你确认」。

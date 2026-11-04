@@ -7,7 +7,7 @@ import AVFoundation
 ///                 "clips": {"listen": {"video": "listen.mov", "frames": 96, "loop": true, "title": "听歌", "desc": "…"}, …},
 ///                 "idle": [{"from": 12, "pets": ["listen", "relax"]}, …],
 ///                 "work": "immerse", "look": "look", "done": "glance"}
-///   *.mov        带透明通道的 HEVC，画面是防御老猫画的奶蛙，逐帧抠出来的
+///   *.mov        带透明通道的 HEVC（预乘透明度），画面是防御老猫画的奶蛙
 ///   pets         有哪几只（菜单里的顺序）；循环的那些空闲、干活都能用
 ///   idle / work  默认的安排，用户可以在 ~/.config/naiwa/config.json 里换（见 Schedule）
 ///   look / done  等你（播完停在最后一帧）/ 做完（惊鸿一瞥）
@@ -74,20 +74,20 @@ struct Assets {
     }
 }
 
-/// 一段片段的播放器：系统硬件解码视频，播放时按帧取出 CGImage 交给图层。
+/// 一段片段的播放器：系统硬件解码视频，播放时按帧取出像素缓冲。
+/// 缓冲是 IOSurface 做底的，直接交给图层显示，不复制、不上传（复制成 CGImage 再贴，空闲循环要多占 8% 左右的 CPU）。
 final class ClipPlayer {
     let duration: Double
-    private let url: URL
     private let item: AVPlayerItem
     private let player: AVPlayer
-    private let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+    private let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+    ])
     private var onEnd: (() -> Void)?
-    /// 第一帧和最后一帧，和播放走同一条解码路径，切过去颜色不会跳
-    private(set) var first: CGImage?
-    private(set) var last: CGImage?
+    private var endObserver: NSObjectProtocol?
 
     init(_ clip: Assets.Clip, fps: Double) {
-        url = clip.video
         duration = Double(clip.frames) / fps
         item = AVPlayerItem(url: clip.video)
         item.add(output)
@@ -95,11 +95,16 @@ final class ClipPlayer {
         player.actionAtItemEnd = .pause
         player.isMuted = true
         player.preventsDisplaySleepDuringVideoPlayback = false
-        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             let done = self?.onEnd
             self?.onEnd = nil
             done?()
         }
+    }
+
+    deinit {
+        player.pause()
+        endObserver.map(NotificationCenter.default.removeObserver)
     }
 
     func play(onEnd: @escaping () -> Void) {
@@ -112,41 +117,10 @@ final class ClipPlayer {
         player.pause()
     }
 
-    /// 当前该显示的新帧；没有新帧返回 nil
-    func nextFrame() -> CGImage? {
+    /// 当前该显示的新帧（BGRA、预乘透明度、IOSurface 做底）；没有新帧返回 nil
+    func nextFrame() -> CVPixelBuffer? {
         let t = output.itemTime(forHostTime: CACurrentMediaTime())
-        guard output.hasNewPixelBuffer(forItemTime: t),
-              let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil) else { return nil }
-        return Self.image(from: pb)
-    }
-
-    func loadStills() async {
-        let asset = AVURLAsset(url: url)
-        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
-              let reader = try? AVAssetReader(asset: asset) else { return }
-        let out = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-        reader.add(out)
-        reader.startReading()
-        var firstImage: CGImage?, lastImage: CGImage?
-        while let sample = out.copyNextSampleBuffer() {
-            guard let pb = CMSampleBufferGetImageBuffer(sample) else { continue }
-            lastImage = Self.image(from: pb)
-            if firstImage == nil { firstImage = lastImage }
-        }
-        first = firstImage
-        last = lastImage
-    }
-
-    /// 解码出来的 BGRA 帧（预乘 alpha）→ CGImage。复制一份，像素缓冲马上还给解码器
-    static func image(from pb: CVPixelBuffer) -> CGImage? {
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
-        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
-        guard let provider = CGDataProvider(data: Data(bytes: base, count: bpr * h) as CFData) else { return nil }
-        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bpr,
-                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                       bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue),
-                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        guard output.hasNewPixelBuffer(forItemTime: t) else { return nil }
+        return output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil)
     }
 }
