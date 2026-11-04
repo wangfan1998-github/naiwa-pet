@@ -4,10 +4,10 @@ import AppKit
 /// 端口能连上 = 奶蛙在；同一个名字只能注册一次，顺带保证只有一只。
 enum Link {
     enum Message: Int32 {
-        case laugh = 1
+        case glance = 1   // 做完的反应（惊鸿一瞥）；旧版叫 laugh
         case quit = 2
         case hook = 3   // 数据：Claude Code hook 的输入 JSON
-        case play = 4   // 兼容旧版的 naiwa play：现在都是笑一下
+        case play = 4   // 兼容旧版的 naiwa play：现在都是瞥一眼
     }
 
     static let portName = "com.nwverse.naiwa" as CFString
@@ -39,11 +39,11 @@ enum Link {
 }
 
 enum CLI {
-    static func laugh() {
-        if Link.send(.laugh) { exit(0) }
+    static func glance() {
+        if Link.send(.glance) { exit(0) }
         // 用户从菜单里让它走了，就别被下一个任务又叫回来
         if Prefs.dismissed { exit(0) }
-        launch(["run", "--laugh"])
+        launch(["run", "--glance"])
         exit(0)
     }
 
@@ -51,7 +51,7 @@ enum CLI {
         exit(Link.send(.play, data: Data(clip.utf8)) ? 0 : 1)
     }
 
-    /// 演示一遍所有状态：空闲 → 干活（沉溺）→ 等你批准 → 批准后接着干 → 干完捧腹大笑
+    /// 演示一遍所有状态：空闲 → 干活（沉溺）→ 等你批准 → 批准后接着干 → 干完惊鸿一瞥
     static func demo() {
         if !Link.send(.hook, data: Data("{}".utf8)) {
             launch(["run"])
@@ -71,7 +71,7 @@ enum CLI {
         event("Notification", ["message": "Claude needs your permission to use Bash", "notification_type": "permission_prompt"], wait: 6,
               "等你批准：睁开眼转过来看着你")
         event("PreToolUse", wait: 3, "批准了：接着沉进去干")
-        event("Stop", ["naiwa_seconds": 125.0], wait: 6, "干完一个活（假装跑了 2 分钟）：捧腹大笑，笑完回到空闲")
+        event("Stop", ["naiwa_seconds": 125.0], wait: 6, "干完一个活（假装跑了 2 分钟）：惊鸿一瞥，瞥完回到空闲")
         event("SessionEnd", wait: 0)
     }
 
@@ -87,7 +87,7 @@ enum CLI {
         let width = (assets.pets.map(\.count).max() ?? 8) + 2
         for p in assets.pets {
             guard let c = assets.clips[p] else { continue }
-            let use = c.loop ? "空闲、干活都能用" : p == assets.look ? "等你批准时" : p == assets.laugh ? "干完一个活时" : ""
+            let use = c.loop ? "空闲、干活都能用" : p == assets.look ? "等你批准时" : p == assets.done ? "干完一个活时、点它时" : ""
             print("  " + p.padding(toLength: width, withPad: " ", startingAt: 0) + c.title + "：" + c.desc + "（" + use + "）")
         }
         print("\n现在的安排（" + (mine ? Schedule.file.path.replacingOccurrences(of: NSHomeDirectory(), with: "~") : "默认") + "）：")
@@ -158,9 +158,9 @@ enum Prefs {
         get { d.bool(forKey: "dismissed") }
         set { d.set(newValue, forKey: "dismissed") }
     }
-    /// 一轮跑满这么多秒、并且动过工具，才算干完一个活（捧腹大笑）
+    /// 一轮跑满这么多秒、并且动过工具，才算干完一个活（惊鸿一瞥）
     static var bigSeconds: Double { d.object(forKey: "bigSeconds") as? Double ?? 60 }
-    /// 跑满这么多秒算超长任务（现在笑法一样，只在气泡里报时长）
+    /// 跑满这么多秒算超长任务（现在反应一样，只在气泡里报时长）
     static var hugeSeconds: Double { d.object(forKey: "hugeSeconds") as? Double ?? 600 }
     static var size: CGFloat {
         get { d.object(forKey: "size") as? CGFloat ?? 150 }

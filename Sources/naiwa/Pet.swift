@@ -4,8 +4,8 @@ import AppKit
 ///   空闲：按一天的时段换一只，在那里慢慢地动（安睡、听歌、悠闲、云幻、封闭、孤独），首尾接上一直循环
 ///   干活：沉溺奶蛙，闭着眼悬浮在水里，沉浸在活里
 ///   等你：沉溺奶蛙睁开眼转过来看着你，停住，头顶冒「项目 等你批准 Bash」
-///   做完：捧腹大笑，头顶冒「项目 做完了 · 时长」；摸它、点它也会笑
-/// 优先级：笑 > 等你 > 干活 > 空闲。笑不会被打断，笑完再回到当时该有的状态。状态之间硬切（透明的画面叠化会出重影）。
+///   做完：惊鸿一瞥：镜头推近，它斜着瞥你一眼，头顶冒「项目 做完了 · 时长」；摸它、点它也会瞥你
+/// 优先级：瞥 > 等你 > 干活 > 空闲。瞥的时候不会被打断，瞥完再回到当时该有的状态。状态之间硬切（透明的画面叠化会出重影）。
 /// 窗口被挡住、屏幕睡了就停播，不白占 CPU。
 final class Pet {
     static var shared: Pet?
@@ -22,7 +22,7 @@ final class Pet {
     /// 现在演的是哪段；nil = 下次 render 重新挑
     private var shown: String?
     private var idleTurn = 0
-    private var celebrating = false
+    private var reacting = false
     private var visible = true
     private var away = false   // 屏幕睡了或者切到了别的用户
     private var frameTimer: Timer?
@@ -61,48 +61,48 @@ final class Pet {
 
     func handle(_ msg: Link.Message, _ data: Data?) {
         switch msg {
-        case .laugh, .play: laugh()
+        case .glance, .play: glance()
         case .quit: NSApp.terminate(nil)
         case .hook: hook(data)
         }
     }
 
-    func laugh() { celebrate(text: nil) }
+    func glance() { react(text: nil) }
 
     private func hook(_ data: Data?) {
         guard let data, let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         if let f = sessions.handle(e), f.tier != .none {
-            celebrate(text: "\(f.project) 做完了 · \(Sessions.duration(f.seconds))")
+            react(text: "\(f.project) 做完了 · \(Sessions.duration(f.seconds))")
         }
         render()
     }
 
     // MARK: 状态
 
-    private func celebrate(text: String?) {
-        guard clip(assets.laugh) != nil else { return }
-        if celebrating {
-            // 正在笑就不打断，快笑完了再来一次就从头笑
+    private func react(text: String?) {
+        guard clip(assets.done) != nil else { return }
+        if reacting {
+            // 正在瞥就不打断，快瞥完了再来一次就从头来
             guard let p = playing, CACurrentMediaTime() - p.start >= p.player.duration * 0.8 else { return }
         }
-        celebrating = true
-        if let text, let c = clip(assets.laugh) {
+        reacting = true
+        if let text, let c = clip(assets.done) {
             bubbleIsWaiting = false
             bubble.show(text, above: panel.frame, for: c.duration + 1.5)
         }
-        shown = assets.laugh
-        play(assets.laugh) { [weak self] in
+        shown = assets.done
+        play(assets.done) { [weak self] in
             guard let self else { return }
-            self.celebrating = false
+            self.reacting = false
             self.shown = nil
             self.render()
         }
     }
 
-    /// 按当前状态摆好奶蛙。正在笑就等笑完（笑完会再调一次）
+    /// 按当前状态摆好奶蛙。正在瞥就等瞥完（瞥完会再调一次）
     private func render() {
         reloadIfEdited()
-        if celebrating { return }
+        if reacting { return }
         let mood = sessions.mood
         if mood == .waiting, let t = sessions.waitingText, bubble.text != t || !bubbleIsWaiting {
             bubbleIsWaiting = true
@@ -167,14 +167,14 @@ final class Pet {
         let now = panel.occlusionState.contains(.visible) && !away
         guard now != visible else { return }
         visible = now
-        if !visible, !celebrating, let s = shown, assets.clips[s]?.loop == true {
+        if !visible, !reacting, let s = shown, assets.clips[s]?.loop == true {
             stopPlaying()
             shown = nil
         }
         if visible { render() }
     }
 
-    /// 到点换下一个时段的奶蛙（正在干活、等你、笑的时候不动，回到空闲时自然换）
+    /// 到点换下一个时段的奶蛙（正在干活、等你、瞥的时候不动，回到空闲时自然换）
     private func scheduleSlotChange() {
         slotTimer?.invalidate()
         guard let at = schedule.nextChange() else { return }
@@ -204,7 +204,7 @@ final class Pet {
     private func use(_ s: Schedule) {
         guard s != schedule else { return }
         schedule = s
-        if let cur = shown, cur != assets.look, cur != assets.laugh, !celebrating {
+        if let cur = shown, cur != assets.look, cur != assets.done, !reacting {
             stopPlaying()
             shown = nil
         }
@@ -306,7 +306,7 @@ final class Pet {
 
     func menu() -> NSMenu {
         let m = NSMenu()
-        m.addItem(item("笑一下") { [weak self] in self?.laugh() })
+        m.addItem(item("瞥你一眼") { [weak self] in self?.glance() })
         let sizes = NSMenu()
         for (name, s) in [("小", 110.0), ("中", 150.0), ("大", 200.0), ("特大", 260.0)] {
             let it = item(name) { [weak self] in self?.resize(to: s) }
@@ -409,7 +409,7 @@ final class PetView: NSView {
     override func mouseMoved(with event: NSEvent) {
         pet?.updatePassThrough()
         if !(window?.ignoresMouseEvents ?? true), stroke.add(NSEvent.mouseLocation) {
-            pet?.laugh()
+            pet?.glance()
         }
     }
 
@@ -439,7 +439,7 @@ final class PetView: NSView {
             pet?.savePosition()
             pet?.updatePassThrough()
         } else {
-            pet?.laugh()
+            pet?.glance()
         }
     }
 

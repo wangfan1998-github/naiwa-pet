@@ -1,6 +1,6 @@
 import Foundation
 
-/// 根据 Claude Code 的 hook 事件给每个会话记账，判断奶蛙该是什么状态、一轮结束时值不值得笑。
+/// 根据 Claude Code 的 hook 事件给每个会话记账，判断奶蛙该是什么状态、一轮结束时值不值得瞥你一眼。
 /// 全在本地算，不调模型。
 final class Sessions {
     enum Mood { case idle, working, waiting }

@@ -6,11 +6,11 @@ import AVFoundation
 ///                 "pets": ["sleep", "listen", …],
 ///                 "clips": {"listen": {"video": "listen.mov", "frames": 96, "loop": true, "title": "听歌", "desc": "…"}, …},
 ///                 "idle": [{"from": 12, "pets": ["listen", "relax"]}, …],
-///                 "work": "immerse", "look": "look", "laugh": "laugh"}
+///                 "work": "immerse", "look": "look", "done": "glance"}
 ///   *.mov        带透明通道的 HEVC，画面是防御老猫画的奶蛙，逐帧抠出来的
 ///   pets         有哪几只（菜单里的顺序）；循环的那些空闲、干活都能用
 ///   idle / work  默认的安排，用户可以在 ~/.config/naiwa/config.json 里换（见 Schedule）
-///   look / laugh 等你（播完停在最后一帧）/ 做完
+///   look / done  等你（播完停在最后一帧）/ 做完（惊鸿一瞥）
 struct Assets {
     struct Clip {
         let video: URL
@@ -24,7 +24,7 @@ struct Assets {
     let clips: [String: Clip]
     let pets: [String]
     let defaults: Schedule
-    let look: String, laugh: String
+    let look: String, done: String
     let credit: (text: String, url: URL?)
 
     /// 能拿来空闲、干活的（循环的）那几只
@@ -45,10 +45,10 @@ struct Assets {
             }
             let pets = (j["pets"] as? [String] ?? clips.keys.sorted()).filter { clips[$0] != nil }
             let defaults = Schedule(json: j, known: Set(clips.keys))
-            let look = j["look"] as? String ?? "", laugh = j["laugh"] as? String ?? ""
-            guard let defaults, clips[laugh] != nil else { continue }
+            let look = j["look"] as? String ?? "", done = j["done"] as? String ?? ""
+            guard let defaults, clips[done] != nil else { continue }
             let c = j["credit"] as? [String: String] ?? [:]
-            return Assets(fps: j["fps"] as? Double ?? 24, clips: clips, pets: pets, defaults: defaults, look: look, laugh: laugh,
+            return Assets(fps: j["fps"] as? Double ?? 24, clips: clips, pets: pets, defaults: defaults, look: look, done: done,
                           credit: (c["text"] ?? "", c["url"].flatMap(URL.init(string:))))
         }
         return nil

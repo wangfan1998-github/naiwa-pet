@@ -156,10 +156,10 @@ enum Hooks {
           }
 
         Codex（~/.codex/config.toml 最上面，[xxx] 表之前；已经有 notify 的话只能留一个）：
-          notify = ["\(binary.replacingOccurrences(of: "'", with: ""))", "laugh"]
+          notify = ["\(binary.replacingOccurrences(of: "'", with: ""))", "glance"]
 
         其他任何命令行：长任务后面接一句
-          make build; naiwa laugh
+          make build; naiwa glance
         """)
     }
 

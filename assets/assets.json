@@ -19,7 +19,7 @@
   "ripple",
   "immerse",
   "look",
-  "laugh"
+  "glance"
  ],
  "clips": {
   "immerse": {
@@ -35,13 +35,6 @@
    "loop": false,
    "title": "沉溺 · 看着你",
    "desc": "睁开眼转过来看着你"
-  },
-  "laugh": {
-   "video": "laugh.mov",
-   "frames": 121,
-   "loop": false,
-   "title": "沉溺 · 大笑",
-   "desc": "捧腹大笑"
   },
   "relax": {
    "video": "relax.mov",
@@ -126,6 +119,13 @@
    "loop": true,
    "title": "涟漪",
    "desc": "仰面漂在落满花瓣的水塘里"
+  },
+  "glance": {
+   "video": "glance.mov",
+   "frames": 113,
+   "loop": false,
+   "title": "惊鸿一瞥",
+   "desc": "镜头推近，它斜着瞥你一眼"
   }
  },
  "idle": [
@@ -163,5 +163,5 @@
  ],
  "work": "immerse",
  "look": "look",
- "laugh": "laugh"
+ "done": "glance"
 }

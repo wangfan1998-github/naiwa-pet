@@ -94,12 +94,15 @@ def solid(alpha: np.ndarray, islands: bool) -> np.ndarray:
 
 
 def shaped(alpha: np.ndarray, c: dict) -> np.ndarray:
-    """按 pets.json 里的手工参数修透明度（比例坐标，原点在左上）：
+    """画面四边渐隐，再按 pets.json 里的手工参数修透明度（比例坐标，原点在左上）：
     erase        [[x0, y0, x1, y1], …] 这些框里清零（云幻右边的电线杆）
     fade_bottom  从这个高度往下渐隐到 0（云幻的云和下面的云连在一起，硬切是一条平边，渐隐像云散开）"""
     h, w = alpha.shape
     alpha = alpha.copy()
     ys, xs = np.mgrid[0:h, 0:w]
+    # 原片四边 3% 内渐隐：主体伸出画面的地方（推近后的身体、晾衣绳两头）不留直边
+    edge = 0.03 * min(h, w)
+    alpha *= np.clip(np.minimum.reduce([xs, w - 1 - xs, ys, h - 1 - ys]) / edge, 0, 1)
     for x0, y0, x1, y1 in c.get("erase", []):
         # 框边上 3% 画面宽度内渐变，不留直边
         f = 0.03 * w
@@ -244,9 +247,12 @@ def main():
     for name, c in clips.items():
         groups.setdefault(c.get("group", name), []).append(name)
     for members in groups.values():
-        box = box_of([frames[m] for m in members])
+        box = box_of([frames[m][slice(*clips[m].get("trim", [None, None]))] for m in members])
         for m in members:
             fs = premultiply(frames[m])
+            if "trim" in clips[m]:  # 只用这一段帧 [起, 止)：惊鸿一瞥推得太近以后 rembg 认不出主体，停在瞥过来那一刻
+                fs = fs[clips[m]["trim"][0]:clips[m]["trim"][1]]
+            fs += [fs[-1]] * clips[m].get("hold_end", 0)  # 最后一帧多停几帧
             if clips[m].get("loop") and "still" not in clips[m]:  # 静图做的动作本来就是整圈，不用叠化
                 fs = crossfade_loop(fs)
             dst = assets / f"{m}.mov"
@@ -263,7 +269,7 @@ def main():
             "pets": [m for m in spec["clips"] if m in have],  # 菜单和 naiwa pets 里的顺序
             "clips": have,
             "idle": [s for s in idle if s["pets"]],
-            **{k: spec[k] for k in ("work", "look", "laugh")}}
+            **{k: spec[k] for k in ("work", "look", "done")}}
     (assets / "assets.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1) + "\n")
 
 
