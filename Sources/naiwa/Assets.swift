@@ -1,7 +1,7 @@
 import AppKit
 import AVFoundation
 
-/// 素材目录（scripts/make_art.py 生成）：
+/// 素材目录：
 ///   assets.json  {"fps": 24,
 ///                 "pets": ["sleep", "listen", …],
 ///                 "clips": {"listen": {"video": "listen.mov", "frames": 96, "loop": true, "title": "听歌", "desc": "…"}, …},
