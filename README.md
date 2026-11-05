@@ -66,7 +66,7 @@
 需要 macOS 13 以上，以及 Command Line Tools（没装的话运行 `xcode-select --install`）。不需要 Xcode。
 
 ```bash
-git clone git@github.com:wangfan1998-github/naiwa-pet.git
+git clone https://github.com/nwverse/naiwa-pet.git
 cd naiwa-pet
 scripts/install.sh       # 编译并装好：~/Applications/Naiwa.app，命令 ~/.local/bin/naiwa，登录时自动出现
 naiwa hooks install      # 接入 Claude Code
@@ -143,9 +143,9 @@ defaults write com.nwverse.naiwa bigSeconds -float 30
 
 **其他命令行**：长任务后面接一句就行，比如 `make build; naiwa glance`。
 
-## 版权
+## 许可证
 
-奶蛙形象和画面另有权利人。本项目不收费、**不要商用**。
+[MIT](LICENSE)
 
 ## 开发
 
