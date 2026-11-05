@@ -83,7 +83,7 @@ enum CLI {
         }
         let s = Schedule.load(assets)
         let mine = FileManager.default.fileExists(atPath: Schedule.file.path)
-        print("有这几只奶蛙（\(assets.credit.text)）：")
+        print("有这几只奶蛙：")
         let width = (assets.pets.map(\.count).max() ?? 8) + 2
         for p in assets.pets {
             guard let c = assets.clips[p] else { continue }

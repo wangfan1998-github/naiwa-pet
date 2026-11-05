@@ -2,7 +2,7 @@
 
   python3 scripts/make_art.py <原片目录> [片段名 ...]
 
-原片：拿防御老猫的原画（裁成以奶蛙为中心的方图）当第一帧，用豆包 Seedance 2.5 图生视频出的 5 秒 1:1 1080p 片子，
+原片：拿原画（裁成以奶蛙为中心的方图）当第一帧，用豆包 Seedance 2.5 图生视频出的 5 秒 1:1 1080p 片子，
 放在原片目录里叫 <src>.mp4；每段用哪张画、提示词是什么见 art/pets.json。处理：
 
   1. 逐帧抠图：rembg isnet-general-use，结果缓存在 build/cut/<src>/；背景是一整片纯色的片段（"key": true）再按背景色补一刀
@@ -265,7 +265,7 @@ def main():
         if m in have:
             have[m].update(title=c["title"], desc=c.get("desc", ""))
     idle = [{**s, "pets": [c for c in s["pets"] if c in have]} for s in spec["idle"]]
-    meta = {"fps": fps, "credit": spec["credit"],
+    meta = {"fps": fps,
             "pets": [m for m in spec["clips"] if m in have],  # 菜单和 naiwa pets 里的顺序
             "clips": have,
             "idle": [s for s in idle if s["pets"]],

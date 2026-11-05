@@ -1,9 +1,5 @@
 {
  "fps": 24,
- "credit": {
-  "text": "画：防御老猫（B 站）",
-  "url": "https://space.bilibili.com/3546757950605988"
- },
  "pets": [
   "sleep",
   "listen",

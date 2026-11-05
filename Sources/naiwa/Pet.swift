@@ -1,6 +1,6 @@
 import AppKit
 
-/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗。画面是防御老猫画的奶蛙，没有声音：
+/// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗，没有声音：
 ///   空闲：按一天的时段换一只，在那里慢慢地动（安睡、听歌、悠闲、云幻、封闭、孤独），首尾接上一直循环；
 ///         鼠标在它身上停一下就换下一只（到下个时段恢复）
 ///   干活：沉溺奶蛙，闭着眼悬浮在水里，沉浸在活里
@@ -367,10 +367,6 @@ final class Pet {
         m.addItem(size)
         m.addItem(.separator())
         scheduleMenu().forEach(m.addItem)
-        m.addItem(.separator())
-        if !assets.credit.text.isEmpty {
-            m.addItem(item(assets.credit.text) { [url = assets.credit.url] in if let url { NSWorkspace.shared.open(url) } })
-        }
         m.addItem(.separator())
         m.addItem(item("让它走（naiwa 叫回来）") {
             Prefs.dismissed = true
