@@ -1,7 +1,7 @@
 import AppKit
 
 let usage = """
-naiwa — 桌面上的奶蛙：空闲时按时段换一只慢慢地动，Claude 干活时沉溺在水里，\n等你批准时睁眼转过来看着你，干完一个活斜着瞥你一眼（惊鸿一瞥）。
+naiwa — 桌面上的奶蛙：空闲时按时段换一只慢慢地动，Claude 干活时还是这只（也可以固定成沉溺奶蛙），\n等你批准时睁眼看着你，干完一个活斜着瞥你一眼（惊鸿一瞥）。
 
 用法：
   naiwa                 把奶蛙放到桌面上（已经在了就什么都不做）
@@ -53,11 +53,11 @@ func runPet(glanceOnStart: Bool) {
         if glanceOnStart { _ = Link.send(.glance) }
         exit(0)
     }
-    Prefs.dismissed = false
     guard let assets = Assets.load() else {
         FileHandle.standardError.write(Data("naiwa: 找不到素材目录（设置 NAIWA_ASSETS 或用打包好的 Naiwa.app）\n".utf8))
         exit(1)
     }
+    Prefs.dismissed = false
     Pet.shared = Pet(assets: assets)
     Pet.shared?.show()
     if glanceOnStart {

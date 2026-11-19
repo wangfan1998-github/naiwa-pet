@@ -11,14 +11,16 @@
      个别片段按 pets.json 手工擦掉一块（erase）、底部渐隐（fade_bottom）；
      再在时间上做 3 帧平均：抠图边缘逐帧会抖，平均一下就稳了（奶蛙动作慢，不会拖影）
   3. loop 的片段首尾叠化：最后 0.5 秒在预乘空间里叠化进开头，片长少 0.5 秒，播完从头接上看不出来
-  4. 裁剪：同一个 group 的片段（干活 / 等你 / 做完都是沉溺奶蛙）用同一个框，切换时奶蛙不跳；
-     框是所有帧里奶蛙出现过的范围的并集，放进方形画布，底边对齐、水平居中
+  4. 裁剪：同一个 group 的片段（同一只的空闲、看着你、做完）用同一个框，切换时奶蛙不跳；
+     框是所有帧里奶蛙出现过的范围的并集，放进方形画布，底边对齐、水平居中。
+     组里既有静图做的空闲、又有 Seedance 出的片子时，先把静图那段按第一帧主体的高度和脚底中点挪进片子的坐标。
+     只点名重做某一段时，同组的别的片段也一起重做
   5. 预乘透明度后编成 HEVC（VideoToolbox，hvc1）。HEVC 透明视频按预乘解释，不预乘边缘会发白
 
 豆包内容审核不让生成的画（安睡、听歌、封闭、孤独），pets.json 里写 "still"：原片目录里放裁好的原画 <src>.png，
 用 animate() 在原画上做呼吸、漂浮、小鱼来回转这类轻微的动作。
 
-没出原片的片段跳过；assets.json 只写有素材的片段，idle 时段里一个片段都没有的时段也跳过（App 会顺延用前一个时段的）。
+每段顺手更新 docs/pets/<片段>.webp（README 里的透明动图）。没出原片的片段跳过；assets.json 只写有素材的片段，idle 时段里一个片段都没有的时段也跳过（App 会顺延用前一个时段的）。
 需要：ffmpeg、rembg（pip install "rembg[cpu]"，会带上 numpy、scipy、Pillow）。
 """
 import json
@@ -40,9 +42,14 @@ def ffmpeg(*args):
     subprocess.run(["ffmpeg", "-v", "error", "-y", *map(str, args)], check=True)
 
 
-def keyed(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+def keyed(rgb: np.ndarray, alpha: np.ndarray, rows: bool = False) -> np.ndarray:
     """背景是一整片纯色的（晾衣奶蛙的蓝天）：离背景色远的像素也算前景，只在身体附近 80 像素内生效（漏掉的肚皮有六七十像素高）。
-    rembg 会隔几十帧把蓝天前面的白肚皮当成背景漏掉，按颜色补回来"""
+    rembg 会隔几十帧把蓝天前面的白肚皮当成背景漏掉，按颜色补回来。
+    rows=True（"key": "rows"）：背景是上下渐变的干净天空（安睡奶蛙），每一行拿这一行左右两边的颜色当背景，整幅画面都补——
+    rembg 会把蓝天前的白云当成背景抠掉，云又伸得比 80 像素远"""
+    if rows:
+        bg = np.median(np.concatenate([rgb[:, :6], rgb[:, -6:]], axis=1), axis=1)[:, None, :]
+        return np.maximum(alpha, np.clip((np.linalg.norm(rgb - bg, axis=-1) - 0.12) / 0.15, 0, 1))
     edge = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]])
     dist = np.linalg.norm(rgb - np.median(edge, axis=0), axis=-1)
     key = np.clip((dist - 0.25) / 0.2, 0, 1)
@@ -50,9 +57,9 @@ def keyed(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
     return np.maximum(alpha, key * near)
 
 
-def cutout(src: Path, fps: int, key: bool = False) -> list[np.ndarray]:
+def cutout(src: Path, fps: int, key: bool | str = False) -> list[np.ndarray]:
     """原片逐帧抠图，返回非预乘的 RGBA（float 0–1）"""
-    cache = ROOT / "build" / "cut" / (src.stem + ("_key" if key else ""))
+    cache = ROOT / "build" / "cut" / (src.stem + ("_key" if key is True else f"_key{key}" if key else ""))
     if not cache.exists() or not any(cache.glob("*.png")):
         from rembg import new_session, remove
 
@@ -67,7 +74,7 @@ def cutout(src: Path, fps: int, key: bool = False) -> list[np.ndarray]:
             out = remove(im, session=session)
             if key:
                 rgb = np.asarray(im, dtype=np.float32) / 255
-                a = keyed(rgb, np.asarray(out, dtype=np.float32)[..., 3] / 255)
+                a = keyed(rgb, np.asarray(out, dtype=np.float32)[..., 3] / 255, rows=key == "rows")
                 out = Image.fromarray((np.dstack([rgb, a]) * 255 + 0.5).astype(np.uint8), "RGBA")
             out.save(cache / p.name)
         shutil.rmtree(raw)
@@ -114,14 +121,30 @@ def shaped(alpha: np.ndarray, c: dict) -> np.ndarray:
     return alpha
 
 
+def despill(f: np.ndarray) -> np.ndarray:
+    """背景是一整片纯色的片段（"key": true）：半透明的边缘和动作拖影里混着背景色（晾衣奶蛙荡起来时腿上一圈蓝），
+    按 颜色 = 透明度 × 前景 + (1 − 透明度) × 背景 反算出前景色。背景色取这一帧完全透明处的中位数"""
+    a = f[..., 3]
+    bg = a < 0.02
+    if bg.sum() < 1000:
+        return f[..., :3]
+    b = np.median(f[..., :3][bg], axis=0)
+    aa = np.clip(a, 0.08, 1)[..., None]
+    fg = np.clip((f[..., :3] - (1 - aa) * b) / aa, 0, 1)
+    edge = ((a > 0.02) & (a < 0.98))[..., None]
+    return np.where(edge, fg, f[..., :3])
+
+
 def steady(fs: list[np.ndarray], c: dict) -> list[np.ndarray]:
-    """清理每帧的透明度，再在时间上做 3 帧平均（首尾帧只和一边平均），颜色不动"""
+    """清理每帧的透明度，再在时间上做 3 帧平均（首尾帧只和一边平均）；纯色背景的片段再去掉边缘混进来的背景色"""
     a = np.stack([shaped(solid(f[..., 3], c.get("islands", False)), c) for f in fs])
     sm = a.copy()
     sm[1:-1] = (a[:-2] + a[1:-1] + a[2:]) / 3
     out = []
     for f, al in zip(fs, sm):
         g = f.copy()
+        if c.get("key") is True:  # 只对纯色背景反算；渐变天空前的白云反算出来是橙的
+            g[..., :3] = despill(f)
         g[..., 3] = al
         out.append(g)
     return out
@@ -167,19 +190,36 @@ def animate(still: np.ndarray, m: dict, fps: int) -> list[np.ndarray]:
 
 
 def still_cutout(src: Path, c: dict) -> np.ndarray:
-    """静态原画抠图（长边缩到 1024），结果缓存在 build/cut/<src>.png"""
-    cache = ROOT / "build" / "cut" / f"{src.stem}.png"
+    """静态原画抠图（长边缩到 1024），结果缓存在 build/cut/<src>.png；"key" 同 cutout（安睡奶蛙的白云要按天空补）"""
+    key = c.get("key", False)
+    cache = ROOT / "build" / "cut" / (src.stem + ("_key" if key is True else f"_key{key}" if key else "") + ".png")
     if not cache.exists():
         from rembg import new_session, remove
 
         im = Image.open(src).convert("RGB")
         im.thumbnail((1024, 1024), Image.LANCZOS)
         cache.parent.mkdir(parents=True, exist_ok=True)
-        remove(im, session=new_session("isnet-general-use", providers=["CPUExecutionProvider"])).save(cache)
+        out = remove(im, session=new_session("isnet-general-use", providers=["CPUExecutionProvider"]))
+        if key:
+            rgb = np.asarray(im, dtype=np.float32) / 255
+            a = keyed(rgb, np.asarray(out, dtype=np.float32)[..., 3] / 255, rows=key == "rows")
+            out = Image.fromarray((np.dstack([rgb, a]) * 255 + 0.5).astype(np.uint8), "RGBA")
+        out.save(cache)
     f = np.asarray(Image.open(cache).convert("RGBA"), dtype=np.float32) / 255
     f = f.copy()
     f[..., 3] = shaped(solid(f[..., 3], c.get("islands", False)), c)
     return f
+
+
+def settled(fs: list[np.ndarray], tail: int = 8) -> int:
+    """看着你：头转过来停住以后，画面基本不动（App 播完会停在最后一帧一直看着你），后面那几秒截掉省体积。
+    按相邻帧的差（预乘后）找最后一段明显在动的地方，再多留 tail 帧；至少留三分之一"""
+    pm = [f[..., :3] * f[..., 3:] for f in fs]
+    d = np.array([np.abs(pm[i + 1] - pm[i]).mean() for i in range(len(pm) - 1)])
+    sm = np.convolve(d, np.ones(5) / 5, mode="same")
+    moving = np.nonzero(sm > sm.max() * 0.25)[0]
+    end = moving[-1] + 1 + tail if len(moving) else len(fs)
+    return int(min(len(fs), max(end, len(fs) // 3)))
 
 
 def premultiply(fs):
@@ -198,6 +238,47 @@ def crossfade_loop(fs, k=XFADE):
     return head + fs[k:n - k]
 
 
+def body_box(alpha: np.ndarray):
+    """一帧里主体（最大的一块）的范围：上、下、左、右"""
+    body = alpha > 0.5
+    lab, n = ndimage.label(body)
+    sizes = ndimage.sum(body, lab, range(1, n + 1))
+    ys, xs = np.nonzero(lab == 1 + int(np.argmax(sizes)))
+    return ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+
+
+def align(fs: list[np.ndarray], ref: np.ndarray) -> list[np.ndarray]:
+    """把一段挪进参考片段的画面坐标：按第一帧主体的高度缩放、脚底中点对齐，画布和参考一样大。
+    静图做的空闲（原画抠图，长边 1024）和 Seedance 出的等你 / 做完（720）分辨率、裁法都不一样，同一组要先对齐才能共用一个框"""
+    a, b = body_box(fs[0][..., 3]), body_box(ref[..., 3])
+    s = (b[1] - b[0]) / (a[1] - a[0])
+    dy, dx = b[1] - s * a[1], (b[2] + b[3]) / 2 - s * (a[2] + a[3]) / 2
+    shape = ref.shape[:2]
+    out = []
+    for f in fs:
+        pm = f.copy()
+        pm[..., :3] *= pm[..., 3:]
+        # 输出 (y, x) 取原图 ((y - dy) / s, (x - dx) / s)，在预乘空间里插值，边缘不发白
+        g = np.stack([ndimage.affine_transform(pm[..., c], [1 / s, 1 / s], offset=[-dy / s, -dx / s],
+                                               output_shape=shape, order=1, mode="constant") for c in range(4)], -1)
+        rgb = np.where(g[..., 3:] > 1e-4, g[..., :3] / np.maximum(g[..., 3:], 1e-4), 0)
+        out.append(np.concatenate([np.clip(rgb, 0, 1), np.clip(g[..., 3:], 0, 1)], -1).astype(np.float32))
+    return out
+
+
+def matched_box(first: np.ndarray, preview: Path, size: int):
+    """组里的空闲片段这次不重做（静图做的、原画不在手边）：照它的预览动图（docs/pets/<名字>.webp）第一帧里主体的位置和大小，
+    反推这一段的裁剪框，切过去时奶蛙落在同一个地方、一样大"""
+    ref = np.asarray(Image.open(preview).convert("RGBA"), dtype=np.float32) / 255
+    k = size / ref.shape[0]
+    t, b, l, r = (v * k for v in body_box(ref[..., 3]))  # 换算到成片的 size
+    T, B, L, R = body_box(first[..., 3])
+    side = int(round((B - T) * size / (b - t)))
+    s = side / size
+    x0, y0 = int(round((L + R) / 2 - (l + r) / 2 * s)), int(round(B - b * s))
+    return x0, y0, x0 + side, y0 + side
+
+
 def box_of(groups: list[list[np.ndarray]]):
     union = None
     for fs in groups:
@@ -211,8 +292,10 @@ def box_of(groups: list[list[np.ndarray]]):
     return int(cx - side // 2), int(bottom + 4 - side), int(cx - side // 2 + side), int(bottom + 4)
 
 
-def encode(fs, box, size, fps, dst: Path):
+def encode(fs, box, size, fps, dst: Path, preview: Path | None = None):
+    """编码成 assets 里的 HEVC；preview 给了就顺手存一张 README 用的动态 WebP（240px，带透明通道）"""
     x0, y0, x1, y1 = box
+    thumbs = []
     with tempfile.TemporaryDirectory() as tmp:
         for i, f in enumerate(fs):
             px = (np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8)
@@ -221,10 +304,18 @@ def encode(fs, box, size, fps, dst: Path):
             canvas = Image.new("RGBa", (x1 - x0, y1 - y0))
             canvas.paste(im, (-x0, -y0))
             canvas = canvas.resize((size, size), Image.LANCZOS)
+            if preview:
+                thumbs.append(canvas.resize((240, 240), Image.LANCZOS).convert("RGBA"))
             # 已经是预乘的：把预乘值原样写进 PNG 交给编码器
             Image.frombytes("RGBA", canvas.size, canvas.tobytes()).save(Path(tmp) / f"{i:04d}.png")
         ffmpeg("-framerate", fps, "-i", Path(tmp) / "%04d.png",
                "-c:v", "hevc_videotoolbox", "-alpha_quality", "0.9", "-q:v", "75", "-tag:v", "hvc1", "-pix_fmt", "bgra", dst)
+    if preview:
+        preview.parent.mkdir(parents=True, exist_ok=True)
+        # 隔一帧取一帧（12 fps），和别的预览一样大小（几百 KB），README 一页要加载十几张
+        thumbs = thumbs[::2]
+        thumbs[0].save(preview, save_all=True, append_images=thumbs[1:], duration=round(2000 / fps), loop=0,
+                       quality=80, method=6)
 
 
 def main():
@@ -240,14 +331,28 @@ def main():
     def source(c):
         return raw / (f"{c['src']}.png" if "still" in c else f"{c['src']}.mp4")
 
+    if only:  # 同一组（同一只的空闲、等你、做完）要一起做，不然框不一样，切过去会跳
+        groups_wanted = {spec["clips"][n].get("group", n) for n in only if n in spec["clips"]}
+        only |= {n for n, c in spec["clips"].items() if c.get("group", n) in groups_wanted}
     clips = {name: c for name, c in spec["clips"].items() if source(c).exists() and (not only or name in only)}
     frames = {name: animate(still_cutout(source(c), c), c["still"], fps) if "still" in c else steady(cutout(source(c), fps, c.get("key", False)), c)
               for name, c in clips.items()}
     groups: dict[str, list[str]] = {}
     for name, c in clips.items():
         groups.setdefault(c.get("group", name), []).append(name)
-    for members in groups.values():
-        box = box_of([frames[m][slice(*clips[m].get("trim", [None, None]))] for m in members])
+    for gname, members in groups.items():
+        # 组里有静图做的、也有 Seedance 出的：静图那段挪进片子的坐标（片子动得多，不去缩它）
+        ref = next((m for m in members if "still" not in clips[m]), None)
+        for m in members:
+            if ref and "still" in clips[m]:
+                frames[m] = align(frames[m], frames[ref][0])
+            if clips[m].get("settle"):  # 看着你：转过来以后的静止部分截掉
+                frames[m] = frames[m][:settled(frames[m])]
+        keep = ROOT / "docs" / "pets" / f"{gname}.webp"
+        if gname in spec["clips"] and gname not in clips and keep.exists():  # 空闲那只这次不重做：对齐到它现在的样子
+            box = matched_box(frames[members[0]][0], keep, size)
+        else:
+            box = box_of([frames[m][slice(*clips[m].get("trim", [None, None]))] for m in members])
         for m in members:
             fs = premultiply(frames[m])
             if "trim" in clips[m]:  # 只用这一段帧 [起, 止)：惊鸿一瞥推得太近以后 rembg 认不出主体，停在瞥过来那一刻
@@ -256,20 +361,24 @@ def main():
             if clips[m].get("loop") and "still" not in clips[m]:  # 静图做的动作本来就是整圈，不用叠化
                 fs = crossfade_loop(fs)
             dst = assets / f"{m}.mov"
-            encode(fs, box, size, fps, dst)
+            encode(fs, box, size, fps, dst, ROOT / "docs" / "pets" / f"{m}.webp")
             have[m] = {"video": dst.name, "frames": len(fs), "loop": bool(clips[m].get("loop")),
                        "title": clips[m]["title"], "desc": clips[m].get("desc", "")}
             print(f"{m}: {len(fs)} 帧 {len(fs) / fps:.2f} 秒，{dst.stat().st_size // 1024}KB，框 {box}")
 
-    for m, c in spec["clips"].items():  # 只重做了几段时，别的片段的名字和介绍也跟着 pets.json 走
+    for m, c in spec["clips"].items():  # 只重做了几段时，别的片段的名字、介绍、等你 / 做完是哪段也跟着 pets.json 走
         if m in have:
             have[m].update(title=c["title"], desc=c.get("desc", ""))
+            for k in ("look", "done"):  # 这只自己的等你 / 做完：那段有素材才写，没有的 App 会退回默认
+                have[m].pop(k, None)
+                if c.get(k) in have:
+                    have[m][k] = c[k]
     idle = [{**s, "pets": [c for c in s["pets"] if c in have]} for s in spec["idle"]]
     meta = {"fps": fps,
             "pets": [m for m in spec["clips"] if m in have],  # 菜单和 naiwa pets 里的顺序
             "clips": have,
             "idle": [s for s in idle if s["pets"]],
-            **{k: spec[k] for k in ("work", "look", "done")}}
+            **{k: spec[k] for k in ("work", "done")}}
     (assets / "assets.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1) + "\n")
 
 

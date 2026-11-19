@@ -3,9 +3,9 @@ import AppKit
 /// 桌面上那只奶蛙：一个透明、置顶、不抢焦点的小窗，没有声音：
 ///   空闲：按一天的时段换一只，在那里慢慢地动（安睡、听歌、悠闲、云幻、封闭、孤独），首尾接上一直循环；
 ///         鼠标在它身上停一下就换下一只（到下个时段恢复）
-///   干活：沉溺奶蛙，闭着眼悬浮在水里，沉浸在活里
-///   等你：沉溺奶蛙睁开眼转过来看着你，停住，头顶冒「项目 等你批准 Bash」
-///   做完：惊鸿一瞥：镜头推近，它斜着瞥你一眼，头顶冒「项目 做完了 · 时长」；摸它、点它也会瞥你
+///   干活：默认还是空闲时那只（跟着时段走）；也可以在菜单里固定成某一只（比如沉溺奶蛙）
+///   等你：干活那只睁开眼看着你，停住，头顶冒「项目 等你批准 Bash」；没有这段的那只原样不动，只冒气泡
+///   做完：干活那只瞥你一眼（惊鸿一瞥），头顶冒「项目 做完了 · 时长」；摸它、点它也会瞥你。没有自己这段的用默认的那段
 /// 优先级：瞥 > 等你 > 干活 > 空闲。瞥的时候不会被打断，瞥完再回到当时该有的状态。状态之间硬切（透明的画面叠化会出重影）。
 /// 窗口被挡住、屏幕睡了、锁屏就停播，不白占 CPU。
 final class Pet {
@@ -15,19 +15,26 @@ final class Pet {
     let view: PetView
     private let assets: Assets
     private var schedule: Schedule
-    private var scheduleStamp: Date?   // config.json 的修改时间，变了就重读（手改了文件不用重启）
+    private let config: ScheduleStore
+    private var configWatcher: ScheduleWatcher?
     private var clips: [String: ClipPlayer] = [:]
+    /// 打不开的片段，不再建播放器
+    private var broken: Set<String> = []
     private let sessions = Sessions()
     private let bubble = Bubble()
     private var playing: (name: String, player: ClipPlayer, start: CFTimeInterval)?
     /// 现在演的是哪段；nil = 下次 render 重新挑
     private var shown: String?
+    /// 现在台上是哪只（循环的那只；它的看着你、瞥你也算它）。干活跟着时段时，空闲、干活、等你、做完都是这只
+    private var pet: String?
+    private var lastMood: Sessions.Mood = .idle
     private var idleTurn = 0
     private var reacting = false
     private var visible = true
-    private var away = Pet.screenLocked()   // 屏幕睡了、锁屏了，或者切到了别的用户
+    private var away = Away(locked: Pet.screenLocked())
     private var frameTimer: Timer?
     private var slotTimer: Timer?
+    private var expiryTimer: Timer?
     private var bubbleIsWaiting = false
     /// 鼠标停在它身上换出来的那只，到下个时段（或者换了安排）就不算了
     private var picked: String?
@@ -36,8 +43,8 @@ final class Pet {
 
     init(assets: Assets) {
         self.assets = assets
-        schedule = Schedule.load(assets)
-        scheduleStamp = Self.stamp()
+        config = ScheduleStore(defaults: assets.defaults, known: Set(assets.loopPets))
+        schedule = config.current
         idleTurn = Int.random(in: 0..<12)
         panel = PetPanel(size: Prefs.size)
         view = PetView(frame: NSRect(x: 0, y: 0, width: Prefs.size, height: Prefs.size))
@@ -48,26 +55,26 @@ final class Pet {
         let nc = NotificationCenter.default, ws = NSWorkspace.shared.notificationCenter
         nc.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in self?.placeOnScreen() }
         nc.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: panel, queue: .main) { [weak self] _ in self?.updateVisibility() }
-        for (n, away) in [(NSWorkspace.screensDidSleepNotification, true), (NSWorkspace.screensDidWakeNotification, false),
-                          (NSWorkspace.sessionDidResignActiveNotification, true), (NSWorkspace.sessionDidBecomeActiveNotification, false)] {
+        for n in Away.workspaceEvents {
             ws.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
-                self?.away = away
+                self?.away.apply(n, lockedNow: Pet.screenLocked())
                 self?.updateVisibility()
             }
         }
         // 锁屏时窗口的遮挡状态还是「看得见」，要单独听锁屏 / 解锁
-        for (n, away) in [("com.apple.screenIsLocked", true), ("com.apple.screenIsUnlocked", false)] {
-            DistributedNotificationCenter.default().addObserver(forName: .init(n), object: nil, queue: .main) { [weak self] _ in
-                self?.away = away
+        for n in Away.lockEvents {
+            DistributedNotificationCenter.default().addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
+                self?.away.apply(n, lockedNow: Pet.screenLocked())
                 self?.updateVisibility()
             }
         }
+        configWatcher = ScheduleWatcher { [weak self] in self?.reloadIfEdited() }
     }
 
     func show() {
         placeOnScreen()
         panel.orderFrontRegardless()
-        visible = !away   // 锁着屏启动就先别播，解锁的通知来了再播
+        visible = !away.any   // 锁着屏启动就先别播，解锁的通知来了再播
         scheduleSlotChange()
         render()
     }
@@ -96,18 +103,20 @@ final class Pet {
     // MARK: 状态
 
     private func react(text: String?) {
-        guard clip(assets.done) != nil else { return }
+        // 台上那只自己的瞥你；没有就用默认的那段
+        let done = assets.done(for: pet)
+        guard let c = clip(done) else { return }
         if reacting {
             // 正在瞥就不打断，快瞥完了再来一次就从头来
             guard let p = playing, CACurrentMediaTime() - p.start >= p.player.duration * 0.8 else { return }
         }
         reacting = true
-        if let text, let c = clip(assets.done) {
+        if let text {
             bubbleIsWaiting = false
             bubble.show(text, above: panel.frame, for: c.duration + 1.5)
         }
-        shown = assets.done
-        play(assets.done) { [weak self] in
+        shown = done
+        play(done) { [weak self] in
             guard let self else { return }
             self.reacting = false
             self.shown = nil
@@ -120,6 +129,9 @@ final class Pet {
         reloadIfEdited()
         if reacting { return }
         let mood = sessions.mood
+        pet = Self.keptPet(pet, mood: mood, lastMood: lastMood)
+        lastMood = mood
+        scheduleExpiry()
         if mood == .waiting, let t = sessions.waitingText, bubble.text != t || !bubbleIsWaiting {
             bubbleIsWaiting = true
             bubble.show(t, above: panel.frame)
@@ -127,28 +139,59 @@ final class Pet {
             bubbleIsWaiting = false
             bubble.hide()
         }
-        var want = mood == .waiting ? assets.look : mood == .working ? schedule.work : idleClip()
-        if clip(want) == nil { want = idleClip() }
-        guard want != shown, visible || want == assets.look else { return }
-        shown = want
+        var p = mood == .idle ? idleClip() : workPet()
+        if clip(p) == nil { p = idleClip() }
+        pet = p
+        let want = mood == .waiting ? assets.look(for: p) : p
         let loop = assets.clips[want]?.loop ?? false
+        guard want != shown, visible || !loop else { return }
+        shown = want
         play(want, loop: loop)   // 不循环的（等你）播完停在最后一帧：一直看着你
     }
 
-    /// 这个时段该出来的那只。鼠标换过就是换出来的那只；已经在演这个时段的某一只就不换；同一时段有几只，每回到空闲换下一只
+    /// 这个时段该出来的那只。鼠标换过就是换出来的那只；台上已经是这个时段的某一只就不换；同一时段有几只，每干完一轮回到空闲换下一只
     private func idleClip() -> String {
-        if let p = picked, assets.clips[p] != nil { return p }
         let names = schedule.slot().pets
-        if let s = shown, names.contains(s) { return s }
-        idleTurn += 1
-        return names[idleTurn % names.count]
+        let validPick = picked.flatMap { assets.clips[$0] != nil ? $0 : nil }
+        return Self.idleCandidate(picked: validPick, shown: pet, names: names,
+                                  broken: broken, turn: &idleTurn) ?? names[0]
+    }
+
+    /// 干活时是哪只：菜单里固定了就是那只；跟着时段就接着用台上那只，干完这轮再换（中途到点换时段也不换）
+    private func workPet() -> String {
+        Self.workCandidate(work: schedule.work, current: pet) { [assets, broken] in
+            assets.clips[$0]?.loop == true && !broken.contains($0)
+        } ?? idleClip()
+    }
+
+    /// 跟着时段时接着用台上那只（还能播的循环片段）；固定了就是那只；nil = 交给空闲的挑法
+    static func workCandidate(work: String, current: String?, playable: (String) -> Bool) -> String? {
+        guard work == Schedule.followSlot else { return work }
+        return current.flatMap { playable($0) ? $0 : nil }
+    }
+
+    /// 干完一轮回到空闲时放掉台上那只，同一时段有几只就换下一只（干活跟着时段时，干活那只就是空闲那只，不放掉就一直不换）。
+    /// 空闲时点它、摸它不算一轮，不换
+    static func keptPet(_ current: String?, mood: Sessions.Mood, lastMood: Sessions.Mood) -> String? {
+        mood == .idle && lastMood != .idle ? nil : current
+    }
+
+    /// 坏掉的悬停选择和时段候选都跳过；没有可播的候选就让调用方停播。
+    static func idleCandidate(picked: String?, shown: String?, names: [String],
+                              broken: Set<String>, turn: inout Int) -> String? {
+        if let picked, !broken.contains(picked) { return picked }
+        let available = names.filter { !broken.contains($0) }
+        guard !available.isEmpty else { return nil }
+        if let shown, available.contains(shown) { return shown }
+        turn += 1
+        return available[turn % available.count]
     }
 
     // MARK: 片段
 
     private func clip(_ name: String) -> ClipPlayer? {
         if let c = clips[name] { return c }
-        guard let c = assets.clips[name] else { return nil }
+        guard !broken.contains(name), let c = assets.clips[name] else { return nil }
         clips[name] = ClipPlayer(c, fps: assets.fps)
         return clips[name]
     }
@@ -157,8 +200,10 @@ final class Pet {
         guard let c = clip(name) else { then?(); return }
         playing?.player.stop()
         playing = (name, c, CACurrentMediaTime())
-        // 播放器只留现在这只和干活 / 等你 / 做完要用的，别的放掉（每个都占着解码器和缓冲）
-        let keep: Set = [name, schedule.work, assets.look, assets.done]
+        // 播放器只留现在这只和它等你 / 做完要用的（固定了干活那只的话也留着它），别的放掉（每个都占着解码器和缓冲）
+        var keep: Set = [name, assets.done(for: pet)]
+        if let pet { keep.formUnion([pet, assets.look(for: pet)]) }
+        if schedule.work != Schedule.followSlot { keep.formUnion([schedule.work, assets.look(for: schedule.work)]) }
         clips = clips.filter { keep.contains($0.key) }
         if frameTimer == nil {
             let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
@@ -169,8 +214,14 @@ final class Pet {
         }
         c.play { [weak self] in
             guard let self, self.playing?.player === c else { return }
-            if loop { return self.play(name, loop: true) }
+            if loop, !c.failed { return self.play(name, loop: true) }
+            // 打不开的停下、去掉，不拿它重播（会空转）；循环的那只退回空闲的另一只，瞥照常收尾
+            if c.failed {
+                self.broken.insert(name)
+                self.clips[name] = nil
+            }
             self.stopPlaying()
+            if loop { self.shown = nil; self.render() }
             then?()
         }
     }
@@ -188,7 +239,7 @@ final class Pet {
 
     /// 被别的窗口挡住、屏幕睡了、锁屏、切走用户：停掉循环；回来再接着演
     private func updateVisibility() {
-        let now = panel.occlusionState.contains(.visible) && !away
+        let now = panel.occlusionState.contains(.visible) && !away.any
         guard now != visible else { return }
         visible = now
         if !visible, !reacting, let s = shown, assets.clips[s]?.loop == true {
@@ -212,25 +263,30 @@ final class Pet {
         slotTimer = t
     }
 
+    /// 会话半天没动静（打断、崩了没收到事件）到点自己回到空闲，不用等下一个事件
+    private func scheduleExpiry() {
+        let at = sessions.nextExpiry
+        if let t = expiryTimer, t.isValid, t.fireDate == at { return }
+        expiryTimer?.invalidate()
+        expiryTimer = nil
+        guard let at else { return }
+        let t = Timer(fire: at, interval: 0, repeats: false) { [weak self] _ in self?.render() }
+        RunLoop.main.add(t, forMode: .common)
+        expiryTimer = t
+    }
+
     // MARK: 安排（哪个时段出来哪几只、干活时是哪只）
 
-    private static func stamp() -> Date? {
-        (try? FileManager.default.attributesOfItem(atPath: Schedule.file.path))?[.modificationDate] as? Date
-    }
-
     private func reloadIfEdited() {
-        let now = Self.stamp()
-        guard now != scheduleStamp else { return }
-        scheduleStamp = now
-        use(Schedule.load(assets))
+        use(config.reload())
     }
 
-    /// 换一套安排：正在演的空闲 / 干活那只要是被换掉了，回到当时该有的那只
+    /// 换一套安排：正在演的空闲 / 干活那只要是被换掉了，回到当时该有的那只（等你那段换了才重播）
     private func use(_ s: Schedule) {
         guard s != schedule else { return }
         schedule = s
         picked = nil
-        if let cur = shown, cur != assets.look, cur != assets.done, !reacting {
+        if let cur = shown, assets.clips[cur]?.loop == true, !reacting {
             stopPlaying()
             shown = nil
         }
@@ -238,12 +294,10 @@ final class Pet {
         render()
     }
 
-    private func change(_ edit: (inout Schedule) -> Void) {
-        var s = schedule
-        edit(&s)
-        try? s.save()
-        scheduleStamp = Self.stamp()
-        use(s)
+    private func change(_ edit: ScheduleStore.Edit) {
+        reloadIfEdited()
+        do { use(try config.apply(edit)) }
+        catch { bubble.show("配置未保存，请检查 config.json", above: panel.frame, for: 5) }
     }
 
     private func scheduleMenu() -> [NSMenuItem] {
@@ -254,7 +308,7 @@ final class Pet {
             let pets = NSMenu()
             for p in assets.loopPets {
                 let it = item("\(assets.title(p))　\(assets.clips[p]?.desc ?? "")") { [weak self] in
-                    self?.change { $0.toggle(p, inSlotFrom: slot.from) }
+                    self?.change(.toggle(p, from: slot.from))
                 }
                 it.state = slot.pets.contains(p) ? .on : .off
                 pets.addItem(it)
@@ -266,7 +320,7 @@ final class Pet {
             idle.addItem(it)
         }
         idle.addItem(.separator())
-        idle.addItem(NSMenuItem(title: "同一时段勾了几只，每回到空闲轮流出来一只", action: nil, keyEquivalent: ""))
+        idle.addItem(NSMenuItem(title: "同一时段勾了几只，每干完一轮回到空闲轮流出来一只", action: nil, keyEquivalent: ""))
         idle.addItem(NSMenuItem(title: "鼠标在奶蛙身上停一下就换下一只，到下个时段恢复", action: nil, keyEquivalent: ""))
         idle.addItem(item("改时段的起止时间…（打开配置文件）") { [weak self] in self?.openConfig() })
         idle.addItem(item("恢复默认") { [weak self] in
@@ -277,21 +331,27 @@ final class Pet {
         idleItem.submenu = idle
 
         let work = NSMenu()
+        let follow = schedule.work == Schedule.followSlot
+        let same = item("跟着时段　空闲时是哪只，干活时还是哪只") { [weak self] in self?.change(.work(Schedule.followSlot)) }
+        same.state = follow ? .on : .off
+        work.addItem(same)
+        work.addItem(.separator())
         for p in assets.loopPets {
-            let it = item("\(assets.title(p))　\(assets.clips[p]?.desc ?? "")") { [weak self] in self?.change { $0.work = p } }
+            let it = item("\(assets.title(p))　\(assets.clips[p]?.desc ?? "")") { [weak self] in self?.change(.work(p)) }
             it.state = schedule.work == p ? .on : .off
             work.addItem(it)
         }
-        let workItem = NSMenuItem(title: "干活时：\(assets.title(schedule.work))", action: nil, keyEquivalent: "")
+        let workItem = NSMenuItem(title: "干活时：\(follow ? "跟着时段" : assets.title(schedule.work))", action: nil, keyEquivalent: "")
         workItem.submenu = work
         return [idleItem, workItem]
     }
 
     /// 打开 config.json 改时段；还没有就先把现在的安排写出去
     private func openConfig() {
-        if !FileManager.default.fileExists(atPath: Schedule.file.path) {
-            try? schedule.save()
-            scheduleStamp = Self.stamp()
+        do { try config.createIfMissing() }
+        catch {
+            bubble.show("无法创建 config.json", above: panel.frame, for: 5)
+            return
         }
         NSWorkspace.shared.open(Schedule.file)
     }
@@ -300,9 +360,8 @@ final class Pet {
 
     func updatePassThrough() {
         guard !view.dragging else { return }
-        let m = NSEvent.mouseLocation
-        let over = panel.frame.contains(m) && view.isOpaque(atScreen: m)
-        if panel.ignoresMouseEvents == over { panel.ignoresMouseEvents = !over }
+        let m = view.mouseLocation()
+        let over = view.updatePassThrough()
         // 停一下：指针进到奶蛙身上开始计时；离开整个窗口才能再来一次（换了一只以后形状变了，指针可能落在透明处，不算离开）
         if over, !hovering {
             hovering = true
@@ -316,7 +375,7 @@ final class Pet {
 
     /// 空闲时换下一只（所有能循环的轮着来），头顶报一下名字
     private func pickNext() {
-        guard !reacting, !view.dragging, sessions.mood == .idle, let cur = shown else { return }
+        guard !reacting, !view.dragging, sessions.mood == .idle, let cur = pet else { return }
         let all = assets.loopPets
         guard let i = all.firstIndex(of: cur) ?? all.indices.first else { return }
         let next = all[(i + 1) % all.count]
@@ -337,6 +396,7 @@ final class Pet {
             origin = NSPoint(x: vf.maxX - size - 24, y: vf.minY)
         }
         panel.setFrame(NSRect(origin: origin ?? .zero, size: CGSize(width: size, height: size)), display: true)
+        followBubble()
     }
 
     func savePosition() { Prefs.origin = panel.frame.origin }
@@ -344,16 +404,26 @@ final class Pet {
     func followBubble() { bubble.follow(panel.frame, animated: false) }
 
     func resize(to size: CGFloat) {
-        // 脚底中点不动
+        // 脚底中点不动，放不下就往屏幕里挪
         let f = panel.frame
-        let origin = NSPoint(x: f.midX - size / 2, y: f.minY)
+        var r = NSRect(x: f.midX - size / 2, y: f.minY, width: size, height: size)
+        if let vf = (panel.screen ?? NSScreen.main)?.visibleFrame { r = Self.clamp(r, into: vf) }
         Prefs.size = size
-        Prefs.origin = origin
-        panel.setFrame(NSRect(origin: origin, size: CGSize(width: size, height: size)), display: true)
+        Prefs.origin = r.origin
+        panel.setFrame(r, display: true)
         followBubble()
     }
 
+    /// 把 r 挪进 vf；比屏幕还宽就水平居中，比屏幕还高就贴底
+    static func clamp(_ r: NSRect, into vf: NSRect) -> NSRect {
+        var o = r.origin
+        o.x = r.width > vf.width ? vf.midX - r.width / 2 : min(max(o.x, vf.minX), vf.maxX - r.width)
+        o.y = r.height > vf.height ? vf.minY : min(max(o.y, vf.minY), vf.maxY - r.height)
+        return NSRect(origin: o, size: r.size)
+    }
+
     func menu() -> NSMenu {
+        reloadIfEdited()
         let m = NSMenu()
         m.addItem(item("瞥你一眼") { [weak self] in self?.glance() })
         let sizes = NSMenu()
@@ -415,6 +485,8 @@ final class PetView: NSView {
     private var downAt: NSPoint = .zero
     private var downOrigin: NSPoint = .zero
     private var stroke = Stroke()
+    /// 指针的屏幕坐标（测试里换成固定的点）
+    var mouseLocation: () -> NSPoint = { NSEvent.mouseLocation }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -437,6 +509,17 @@ final class PetView: NSView {
         layer?.contents = surface
         CATransaction.commit()
         current = pb
+        // 指针没动、画面换了形状也要跟着切穿透；指针不在窗口里就不用管。只切穿透，不碰悬停计时
+        if !dragging, let win = window, win.frame.contains(mouseLocation()) { updatePassThrough() }
+    }
+
+    /// 按指针下当前帧的像素切换窗口接不接鼠标，返回指针是不是落在奶蛙实心处
+    @discardableResult func updatePassThrough() -> Bool {
+        guard let win = window else { return false }
+        let m = mouseLocation()
+        let over = win.frame.contains(m) && isOpaque(atScreen: m)
+        if win.ignoresMouseEvents == over { win.ignoresMouseEvents = !over }
+        return over
     }
 
     /// 屏幕坐标这一点上奶蛙是不是实心的（透明处让鼠标穿过去）：直接读当前帧那个像素的透明度
@@ -526,6 +609,29 @@ struct Stroke {
             return true
         }
         return false
+    }
+}
+
+/// 屏幕睡了、切到了别的用户、锁屏了：三件事分开记，哪个通知后到都不会盖掉别的（睡着时锁了屏，屏幕醒来还锁着）
+struct Away {
+    var asleep = false, inactive = false, locked = false
+    var any: Bool { asleep || inactive || locked }
+
+    static let workspaceEvents = [NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification,
+                                  NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification]
+    static let lockEvents = [Notification.Name("com.apple.screenIsLocked"), Notification.Name("com.apple.screenIsUnlocked")]
+
+    /// 每个通知只改自己那一项；醒来 / 切回来时再查一次锁屏：解锁通知可能早在醒来前就到了，也可能根本不来
+    mutating func apply(_ n: Notification.Name, lockedNow: @autoclosure () -> Bool) {
+        switch n {
+        case NSWorkspace.screensDidSleepNotification: asleep = true
+        case NSWorkspace.screensDidWakeNotification: asleep = false; locked = lockedNow()
+        case NSWorkspace.sessionDidResignActiveNotification: inactive = true
+        case NSWorkspace.sessionDidBecomeActiveNotification: inactive = false; locked = lockedNow()
+        case Away.lockEvents[0]: locked = true
+        case Away.lockEvents[1]: locked = false
+        default: break
+        }
     }
 }
 
