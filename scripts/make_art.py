@@ -233,6 +233,29 @@ def gesture(still: np.ndarray, g: dict, fps: int) -> list[np.ndarray]:
     return out
 
 
+def jolt(fs: list[np.ndarray], g: dict, fps: int) -> list[np.ndarray]:
+    """在片子每一帧上叠「被电一下」：at 里每个时刻（秒）整个画面以中心猛地放大 amp 再弹回，持续 dur 秒。
+    缠线奶蛙是俯拍仰躺着的，放大读起来就是一下弹起来；片子本身的变化（屏幕闪、光线变）照旧"""
+    h, w = fs[0].shape[:2]
+    cy, cx = h / 2, w / 2
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = []
+    for i, f in enumerate(fs):
+        t = i / fps
+        k = sum(np.sin(np.pi * (t - t0) / g.get("dur", 0.22)) for t0 in g["at"] if 0 <= t - t0 <= g.get("dur", 0.22))
+        s = 1 + g.get("amp", 0.06) * k
+        if s == 1:
+            out.append(f)
+            continue
+        pm = f.copy()
+        pm[..., :3] *= pm[..., 3:]
+        sy, sx = cy + (yy - cy) / s, cx + (xx - cx) / s
+        g2 = np.stack([ndimage.map_coordinates(pm[..., c], [sy, sx], order=1, mode="constant") for c in range(4)], -1)
+        rgb = np.where(g2[..., 3:] > 1e-4, g2[..., :3] / np.maximum(g2[..., 3:], 1e-4), 0)
+        out.append(np.concatenate([np.clip(rgb, 0, 1), np.clip(g2[..., 3:], 0, 1)], -1).astype(np.float32))
+    return out
+
+
 def still_cutout(src: Path, c: dict) -> np.ndarray:
     """静态原画抠图（长边缩到 1024），结果缓存在 build/cut/<src>.png；"key" 同 cutout（安睡奶蛙的白云要按天空补）"""
     key = c.get("key", False)
@@ -373,13 +396,16 @@ def main():
     have = {k: v for k, v in (old.get("clips") or {}).items() if (assets / v["video"]).exists()}
 
     def source(c):
-        return raw / (f"{c['src']}.png" if "still" in c or "gesture" in c else f"{c['src']}.mp4")
+        on_still = "still" in c or ("gesture" in c and c["gesture"]["kind"] != "jolt")
+        return raw / (f"{c['src']}.png" if on_still else f"{c['src']}.mp4")
 
     if only:  # 同一组（同一只的空闲、等你、做完）要一起做，不然框不一样，切过去会跳
         groups_wanted = {spec["clips"][n].get("group", n) for n in only if n in spec["clips"]}
         only |= {n for n, c in spec["clips"].items() if c.get("group", n) in groups_wanted}
     clips = {name: c for name, c in spec["clips"].items() if source(c).exists() and (not only or name in only)}
     def make(c):
+        if "gesture" in c and c["gesture"]["kind"] == "jolt":  # 片子上叠弹动
+            return jolt(steady(cutout(source(c), fps, c.get("key", False)), c, source(c), fps), c["gesture"], fps)
         if "gesture" in c:  # 原画上的程序动作（豆包不肯出片的画）
             return gesture(still_cutout(source(c), c), c["gesture"], fps)
         if "still" in c:
@@ -392,9 +418,9 @@ def main():
         groups.setdefault(c.get("group", name), []).append(name)
     for gname, members in groups.items():
         # 组里有静图做的、也有 Seedance 出的：静图那段挪进片子的坐标（片子动得多，不去缩它）
-        ref = next((m for m in members if "still" not in clips[m] and "gesture" not in clips[m]), None)
+        ref = next((m for m in members if "still" not in clips[m] and clips[m].get("gesture", {}).get("kind", "jolt") == "jolt"), None)
         for m in members:
-            if ref and ("still" in clips[m] or "gesture" in clips[m]):  # 原画做的（静图动作、程序动作）都挪进片子坐标
+            if ref and ("still" in clips[m] or ("gesture" in clips[m] and clips[m]["gesture"]["kind"] != "jolt")):  # 原画做的（静图动作、程序动作）都挪进片子坐标
                 frames[m] = align(frames[m], frames[ref][0])
             if clips[m].get("settle"):  # 看着你：转过来以后的静止部分截掉
                 frames[m] = frames[m][:settled(frames[m])]
