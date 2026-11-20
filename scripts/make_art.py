@@ -8,7 +8,7 @@
   1. 逐帧抠图：rembg isnet-general-use，结果缓存在 build/cut/<src>/；背景是一整片纯色的片段（"key": true）再按背景色补一刀
   2. 清理透明度：去掉和主体不连着的零碎小块（没抠干净的栏杆、阴影；"islands": true 的片段不去，比如身边一圈小鱼）；
      身体里面补成不透明（rembg 会把反光的肚皮当成半透明，深色桌面上发灰）；
-     个别片段按 pets.json 手工擦掉一块（erase）、底部渐隐（fade_bottom）；
+     个别片段按 pets.json 手工擦掉一块（erase）、底部渐隐（fade_bottom）；身体基本不动、泡在水里的片段（"matte": "first"）整段用开头几帧的轮廓；
      再在时间上做 3 帧平均：抠图边缘逐帧会抖，平均一下就稳了（奶蛙动作慢，不会拖影）
   3. loop 的片段首尾叠化：最后 0.5 秒在预乘空间里叠化进开头，片长少 0.5 秒，播完从头接上看不出来
   4. 裁剪：同一个 group 的片段（同一只的空闲、看着你、做完）用同一个框，切换时奶蛙不跳；
@@ -135,9 +135,23 @@ def despill(f: np.ndarray) -> np.ndarray:
     return np.where(edge, fg, f[..., :3])
 
 
-def steady(fs: list[np.ndarray], c: dict) -> list[np.ndarray]:
+def original_rgb(src: Path, fps: int) -> list[np.ndarray]:
+    """原片逐帧的原色（0–1）。抠图工具在它认为是背景的地方把颜色也清成了黑色，套固定轮廓时要用原色"""
+    with tempfile.TemporaryDirectory() as t:
+        ffmpeg("-i", src, "-vf", f"fps={fps}", Path(t) / "%04d.png")
+        return [np.asarray(Image.open(q).convert("RGB"), dtype=np.float32) / 255 for q in sorted(Path(t).glob("*.png"))]
+
+
+def steady(fs: list[np.ndarray], c: dict, src: Path | None = None, fps: int = 24) -> list[np.ndarray]:
     """清理每帧的透明度，再在时间上做 3 帧平均（首尾帧只和一边平均）；纯色背景的片段再去掉边缘混进来的背景色"""
     a = np.stack([shaped(solid(f[..., 3], c.get("islands", False)), c) for f in fs])
+    if c.get("matte") == "first":
+        # 身体基本不动的片段（泡在水里的侧眼、花瓣落在肚子上）：逐帧抠图会把水下的身体当成水抠掉，
+        # 拿开头 6 帧（和空闲第一帧一样、抠得准）的中位数当轮廓，套到每一帧上
+        a = np.repeat(np.median(a[:6], axis=0)[None], len(a), axis=0)
+        rgb = original_rgb(src, fps) if src else None
+        if rgb and len(rgb) >= len(fs):
+            fs = [np.dstack([rgb[i], f[..., 3]]) for i, f in enumerate(fs)]
     sm = a.copy()
     sm[1:-1] = (a[:-2] + a[1:-1] + a[2:]) / 3
     out = []
@@ -186,6 +200,36 @@ def animate(still: np.ndarray, m: dict, fps: int) -> list[np.ndarray]:
             frame = layer + frame * (1 - layer[..., 3:])
         rgb = np.where(frame[..., 3:] > 1e-4, frame[..., :3] / np.maximum(frame[..., 3:], 1e-4), 0)
         out.append(np.concatenate([np.clip(rgb, 0, 1), frame[..., 3:]], -1).astype(np.float32))
+    return out
+
+
+def gesture(still: np.ndarray, g: dict, fps: int) -> list[np.ndarray]:
+    """豆包怎么都不肯出片的画（孤独奶蛙：背对着站的身影一律被拦），在原画上做程序动作，脸和身体完全是原画：
+    lean  往一边歪过去（angle 度，正数往右）停住，in 秒歪到位，再停 hold 秒（等你：侧身在听）
+    rock  左右晃 swings 下、幅度 angle 度、越晃越小，period 秒后回到原位（做完）
+    都以脚底中点为轴；整块一起转（扶着的椅子跟着歪，像靠在椅子上）"""
+    pm = still.copy()
+    pm[..., :3] *= pm[..., 3:]
+    h, w = pm.shape[:2]
+    t, b, l, r = body_box(pm[..., 3])
+    py, px = b, (l + r) / 2
+    if g["kind"] == "lean":
+        n = round((g.get("in", 0.6) + g.get("hold", 2.4)) * fps)
+        k_in = max(1, round(g.get("in", 0.6) * fps))
+        angles = [g["angle"] * (1 - (1 - min(i / k_in, 1)) ** 3) for i in range(n)]
+    else:  # rock
+        n = round(g.get("period", 2.5) * fps)
+        angles = [g["angle"] * np.sin(2 * np.pi * g.get("swings", 2) * i / n) * (1 - i / n) for i in range(n)]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = []
+    for a in angles:
+        th = np.deg2rad(a)
+        # 输出 (x, y) 取原图里绕脚底转回去的位置
+        sx = px + (xx - px) * np.cos(th) + (yy - py) * np.sin(th)
+        sy = py - (xx - px) * np.sin(th) + (yy - py) * np.cos(th)
+        f = np.stack([ndimage.map_coordinates(pm[..., c], [sy, sx], order=1, mode="constant") for c in range(4)], -1)
+        rgb = np.where(f[..., 3:] > 1e-4, f[..., :3] / np.maximum(f[..., 3:], 1e-4), 0)
+        out.append(np.concatenate([np.clip(rgb, 0, 1), np.clip(f[..., 3:], 0, 1)], -1).astype(np.float32))
     return out
 
 
@@ -329,22 +373,28 @@ def main():
     have = {k: v for k, v in (old.get("clips") or {}).items() if (assets / v["video"]).exists()}
 
     def source(c):
-        return raw / (f"{c['src']}.png" if "still" in c else f"{c['src']}.mp4")
+        return raw / (f"{c['src']}.png" if "still" in c or "gesture" in c else f"{c['src']}.mp4")
 
     if only:  # 同一组（同一只的空闲、等你、做完）要一起做，不然框不一样，切过去会跳
         groups_wanted = {spec["clips"][n].get("group", n) for n in only if n in spec["clips"]}
         only |= {n for n, c in spec["clips"].items() if c.get("group", n) in groups_wanted}
     clips = {name: c for name, c in spec["clips"].items() if source(c).exists() and (not only or name in only)}
-    frames = {name: animate(still_cutout(source(c), c), c["still"], fps) if "still" in c else steady(cutout(source(c), fps, c.get("key", False)), c)
-              for name, c in clips.items()}
+    def make(c):
+        if "gesture" in c:  # 原画上的程序动作（豆包不肯出片的画）
+            return gesture(still_cutout(source(c), c), c["gesture"], fps)
+        if "still" in c:
+            return animate(still_cutout(source(c), c), c["still"], fps)
+        return steady(cutout(source(c), fps, c.get("key", False)), c, source(c), fps)
+
+    frames = {name: make(c) for name, c in clips.items()}
     groups: dict[str, list[str]] = {}
     for name, c in clips.items():
         groups.setdefault(c.get("group", name), []).append(name)
     for gname, members in groups.items():
         # 组里有静图做的、也有 Seedance 出的：静图那段挪进片子的坐标（片子动得多，不去缩它）
-        ref = next((m for m in members if "still" not in clips[m]), None)
+        ref = next((m for m in members if "still" not in clips[m] and "gesture" not in clips[m]), None)
         for m in members:
-            if ref and "still" in clips[m]:
+            if ref and ("still" in clips[m] or "gesture" in clips[m]):  # 原画做的（静图动作、程序动作）都挪进片子坐标
                 frames[m] = align(frames[m], frames[ref][0])
             if clips[m].get("settle"):  # 看着你：转过来以后的静止部分截掉
                 frames[m] = frames[m][:settled(frames[m])]
@@ -358,7 +408,7 @@ def main():
             if "trim" in clips[m]:  # 只用这一段帧 [起, 止)：惊鸿一瞥推得太近以后 rembg 认不出主体，停在瞥过来那一刻
                 fs = fs[clips[m]["trim"][0]:clips[m]["trim"][1]]
             fs += [fs[-1]] * clips[m].get("hold_end", 0)  # 最后一帧多停几帧
-            if clips[m].get("loop") and "still" not in clips[m]:  # 静图做的动作本来就是整圈，不用叠化
+            if clips[m].get("loop") and "still" not in clips[m]:  # 静图做的动作本来就是整圈，不用叠化（gesture 都不循环）
                 fs = crossfade_loop(fs)
             dst = assets / f"{m}.mov"
             encode(fs, box, size, fps, dst, ROOT / "docs" / "pets" / f"{m}.webp")
